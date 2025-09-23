@@ -1,0 +1,18 @@
+version: '3.8'
+services: # defines a service named db and each service becomes one or more container
+  db:
+    image: timescale/timescaledb:latest-pg17 # pull the official timescaleDB image
+    container_name: hedge-timescaledb
+    restart: unless-stopped # automatic restart of the container
+    environment: # env variables from .env file
+      POSTGRES_USER: ${PGUSER}
+      POSTGRES_PASSWORD: ${PGPASS}
+      POSTGRES_DB: ${PGDB}
+      TIMESCALEDB_TELEMETRY: "off"
+    ports:
+      - "${PGPORT:-5432}:5432" 
+    volumes:
+      - db_data:/var/lib/postgresql/data # db_data is Docker volume where Postgres stores its data directory
+      - ./sql:/docker-entrypoint-initdb.d:ro # sql folder is mounted ready-only so the file inside are executed
+  volumes:
+    db_data: # declare the named volume. Docker manages its location in the WSL2 Linux filesystem. You don’t check this into Git, it’s runtime state./
