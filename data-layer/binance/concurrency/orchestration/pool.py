@@ -170,20 +170,20 @@ class WorkerPool:
                            # print(f"[Worker DEBUG] Completed job #{self._completentions}: {job['start_min']}→{job['end_min']} | Active workers={self._granted_permits}")
                 print(f"[Worker DEBUG] Completed job #{self._completentions}: {job['start_min']}→{job['end_min']} | Active workers={self._granted_permits}")
 
-                self._semaphore.release()
                 break  # success, exit loop
-
+            
             except RateLimitError:
                 time.sleep(0.5)
                 continue  # retry same job
-
             except Exception as e:
                 retries += 1
                 print(f"[Worker] Job {job} failed with exception: {e}, retry {retries}")
-                self._semaphore.release()
                 if retries >= max_retries:
                     print(f"[Worker] Job {job} exceeded max retries, skipping")
                     break
+            finally:
+                self._semaphore.release()
+
 
     def submit_all(self, jobs: List[Dict[str, Any]]):
         """Submit all jobs at once and wait for completion."""

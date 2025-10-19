@@ -19,7 +19,7 @@ from binance.concurrency.orchestration.jobs import (
     INTERVAL_MIN,
 )
 
-from binance.concurrency.network.RTT import RoundTimeTripEMA
+from binance.concurrency.network.rtt import RoundTimeTripEMA
 
 # --- Small helper: parse Binance kline rows into dicts ---------------------------------
 # Binance /api/v3/klines returns list of rows shaped like:
@@ -52,28 +52,28 @@ def _rows_to_dicts(symbol: str, interval: str, rows: List[List[Any]]) -> List[Di
         )
     return out
 
-def parse(df):
-    """
-    Convert `open_time` and `close_time` columns (seconds since epoch) 
-    to ISO 8601 format strings.
-    """
-    # Converte columns from milliseconds to ISO 8601
-    for col in ["open_time", "close_time"]:
-        df = df.with_columns(
-            pl.col(col)
-            .cast(pl.Datetime(time_unit="ms"))      
-            # .dt.strftime("%Y-%m-%dT%H:%M")     # ISO 8601 with literal Z
-            .alias(col)
-        )
-    # Separate date and time in two columns    
-    df = df.with_columns(pl.col("open_time").dt.strftime("%Y-%m-%d").alias('Date'))
-    df = df.with_columns(pl.col("open_time").dt.strftime("%H:%M").alias('open_time_only'))
-    df = df.with_columns(pl.col("close_time").dt.strftime("%H:%M").alias('close_time_only'))
+# def parse(df):
+#     """
+#     Convert `open_time` and `close_time` columns (seconds since epoch) 
+#     to ISO 8601 format strings.
+#     """
+#     # Converte columns from milliseconds to ISO 8601
+#     for col in ["open_time", "close_time"]:
+#         df = df.with_columns(
+#             pl.col(col)
+#             .cast(pl.Datetime(time_unit="ms"))      
+#             # .dt.strftime("%Y-%m-%dT%H:%M")     # ISO 8601 with literal Z
+#             .alias(col)
+#         )
+#     # Separate date and time in two columns    
+#     df = df.with_columns(pl.col("open_time").dt.strftime("%Y-%m-%d").alias('Date'))
+#     df = df.with_columns(pl.col("open_time").dt.strftime("%H:%M").alias('open_time_only'))
+#     df = df.with_columns(pl.col("close_time").dt.strftime("%H:%M").alias('close_time_only'))
     
-    # Drop old columns
-    df = df.drop(["open_time", "close_time"])
+#     # Drop old columns
+#     df = df.drop(["open_time", "close_time"])
 
-    return df 
+#     return df 
 
 # Public function
 def get_klines(
@@ -196,7 +196,7 @@ def get_klines(
         df = pl.DataFrame(results)
         # Sort by open time
         df = df.sort(["open_time"])
-        df = parse(df)
+        # df = parse(df)
     
     output_directory = os.path.expanduser("~/hedge-room/data/binance/spot") # python standard library function that replaces the ~ with the path to the current user’s home directory
     os.makedirs(output_directory, exist_ok=True) # ensures the directory exists
@@ -213,9 +213,9 @@ if __name__ == "__main__":
     start_time = datetime.datetime.now()
 
     SYMBOL = "ETHUSDT"
-    INTERVAL = "5m"
-    START = "2020-01-01 00:00"
-    END   = "2025-10-14 00:00"
+    INTERVAL = "1m"
+    START = "2024-01-01 00:00"
+    END   = "2025-01-01 00:00"
 
     df, path = get_klines(SYMBOL, INTERVAL, START, END, per_request_limit=1000)
     print(f"Fetched {len(df)} rows → wrote {path}")
