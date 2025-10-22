@@ -117,7 +117,7 @@ class HttpClient:
         try:
             return float(ra)
         except ValueError:
-            return None
+            return print("The client couldn't access the response header")
 
     def rotate_host(self) -> None:
         if len(self.hosts) > 1:

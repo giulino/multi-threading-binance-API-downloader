@@ -143,7 +143,9 @@ def build_kline_request(job: Dict[str, Any]):
     start_ms = int(job["start_min"]) * 60_000
     end_ms = int(job["end_min"]) * 60_000
     return (
+        # path
         "/api/v3/klines",
+        # params
         {
             "symbol": job["symbol"],
             "interval": job["interval"],

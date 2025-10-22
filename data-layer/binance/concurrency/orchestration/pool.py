@@ -3,13 +3,13 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 import threading
 import time
+import numpy as np
 
 from typing import Optional, Callable, Any, Tuple, Dict, List
 
 # import project dependencies
-from binance.concurrency.network.client_http import HttpClient, HttpResult, RateLimitError
+from binance.concurrency.network.client_http import HttpClient, HttpResult
 from binance.concurrency.network.spot_throttle import spot_throttle, SpotWeights
-from binance.concurrency.network.rtt import RoundTimeTripEMA
 from binance.concurrency.orchestration.autoscaler import Autoscaler
 
 class WorkerPool:
@@ -25,14 +25,14 @@ class WorkerPool:
     simultaneous in-flight requests without recreating threads. Before each
     request, a shared spot_throttle is consulted to pre-reserve REQUEST_WEIGHT,
     guaranteeing we never overshoot Binance’s sliding 60s limits. After each
-    request, we update an RTT EMA and autoscale concurrency every n completetions.
+    request, we update an rtt_s EMA and autoscale concurrency every n completetions.
 
     Key responsibilities
     --------------------
     - Job dispatch: pull jobs from a Queue and run them on a thread pool.
     - Concurrency control: semaphore reflects current permitted parallelism.
     - Rate limiting: call throttle.acquire(weight) *before* every request.
-    - RTT feedback: feed res.elapsed_ms to a shared EMA estimator.
+    - rtt_s feedback: feed res.elapsed_ms to a shared EMA estimator.
     - Autoscaling: periodically ask an autoscaler policy for a new target and
       adjust permits smoothly (scale up via semaphore release; scale down by
       absorbing permits on completion).
@@ -43,23 +43,18 @@ class WorkerPool:
             self, 
             http: HttpClient,  # shared HTTP client (handles retries, errors, etc.)
             throttle: spot_throttle,  # shared spot_throttle instance for rate-limiting
-            rtt_update: Callable[[float], float],  # function to update shared RTT EMA
             request_builder: Callable[[Dict[str, Any]], Tuple[str, Dict[str, Any]]],  # builds endpoint + params
             response: Callable[[HttpResult, Dict[str, Any]], None],  # handles response
-            autoscale: Callable[[float], int],  # function that decides target concurrency
             weight_per_request: int = SpotWeights.KLINES,  # Binance weight per request (default 2)
             max_threads: int = 100,  # maximum thread count
-            initial_concurrency: int = 1,  # initial active workers
-            autoscale_trigger: int = 10,  # autoscale trigger (every K completentions)
+            initial_concurrency: int = 1  # initial active workers
         ):
 
         # ---- Assign injected dependencies ----
         self.http = http
         self.throttle = throttle
-        self.rtt_update = rtt_update
         self.request_builder = request_builder
         self.response = response
-        self.autoscale = autoscale
         self.weight = int(weight_per_request)
 
         # ---- Internal infrastructure 
@@ -68,128 +63,64 @@ class WorkerPool:
 
         # ---- Concurrency accounting ----
         self._lock = threading.Lock()  # protects shared counters below
-        self._desired_permits = max(1, int(initial_concurrency))  # target concurrency
-        self._granted_permits = max(1, int(initial_concurrency))  # currently active permits
-
-        # ---- Autoscaling parameters ----
-        self._completentions = 0  # number of finished jobs since last autoscale
-        self._autoscale_trigger = int(autoscale_trigger)
-
-        # Worker tracking
-        self._active_workers = 0
-        self._min_workers = float('inf')
-        self._max_workers = 0
     
         # ---- Runtime state ----
         self._max_threads = int(max_threads)
-        self._started = False  # ensures workers are launched only once
-        self._scaled_up = False
-
-    # ======================
-    # Autoscaling Logic
-    # ======================
-
-    def check_autoscale(self, rtt_seconds: Optional[float]):
-        if rtt_seconds is None:
-            return
-        
-        workers = self.autoscale(rtt_seconds)
-
-        delta = workers - self._granted_permits
-        # DEBUG: log internal state
-        print(f"[Autoscale DEBUG] RTT EMA={rtt_seconds:.3f}s | "
-                f"Granted={self._granted_permits} | "
-                f"Desired={self._desired_permits} | "
-                f"TargetWorkers={workers} | Delta={delta}")
-        if delta == 0:
-            print("[Autoscale DEBUG] Delta=0, no scale change occurs")
-
-        self.adjust_workers(workers)
-
-    def adjust_workers(self, workers: int):
-        """
-        Adjust the active number of concurrent workers.
-        - If new workers > current workers → immediately release extra semaphore permits (scale up)
-        - If new workers < current workers → mark permits to remove gradually (scale down)
-        """
-        workers = max(1, min(int(workers), self._max_threads))  # clamp between 1 and max_threads
-        delta = workers - self._granted_permits  # difference between target and current
-        self._desired_permits = workers
-        if delta > 0:
-            # ---- SCALE UP ----
-            for _ in range(delta):
-                try:
-                    self._semaphore.release()  # add new available permit
-                    self._granted_permits += abs(delta)
-                except ValueError:
-                    break  # if semaphore is already full
-            print(f"[Scale Up] Added {delta} permits, granted now={self._granted_permits}")
     
     # ======================
     # Worker Execution Loop
     # ======================
 
     def _run_job(self, job: Dict[str, Any], max_retries: int = 3):
-        """Run a single job with throttling, RTT update, and autoscaling."""
+        """Run a single job for a fixed number of workers"""
+        
         retries = 0
+
         while True:
             try:    
-                print(f"[Worker DEBUG] Before acquiring semaphore: Granted={self._granted_permits}, ActiveWorkers={self._active_workers}")
+                print(f"[_run_job DEBUG] Acquire semaphore permit: Granted={self._granted_permits}")
                 # Acquire concurrency permit
                 self._semaphore.acquire()
-
-                # Update active workers
-                with self._lock:
-                    self._active_workers = self._granted_permits
-                    self._min_workers = min(self._min_workers, self._active_workers)
-                    self._max_workers = max(self._max_workers, self._active_workers)
                 
                 # Pre-reserve weight in throttle
                 self.throttle.acquire(self.weight)
 
-                # Build and send request
+                # Build request
                 path, params = self.request_builder(job)
-                result = self.http.get(path, params=params)
 
-                # RTT
+                # Send request
+                try: 
+                    result = self.http.get(path, params=params)
+                except Exception as e:
+                    print(f"[_run_job DEBUG] Execution stopped - Job {job} failed with exception: {e}")
+                    break
+
+                # Retrieve round time trip in seconds
                 try:
-                    ema_ms = self.rtt_update(result.elapsed_ms)
+                    rtt_s = (result.elapsed_ms) / 1000
                 except Exception:
-                    ema_ms = None
+                    rtt_s = None
 
                 # Process the result
                 self.response(result, job)
 
-                # Record completion & maybe autoscale
-                with self._lock:
-                    self._completentions += 1
-                if self._completentions == self._autoscale_trigger:
-                        with self._lock:
-                           self._scaled_up = True
-                           self.check_autoscale(result.elapsed_ms if ema_ms is None else ema_ms / 1000.0)
-                           # print(f"[Worker DEBUG] Completed job #{self._completentions}: {job['start_min']}→{job['end_min']} | Active workers={self._granted_permits}")
-                print(f"[Worker DEBUG] Completed job #{self._completentions}: {job['start_min']}→{job['end_min']} | Active workers={self._granted_permits}")
+                print(f"[_run_job DEBUG] Job completed in {rtt_s} seconds.")
+                print(" ")
+                print(f"[_run_job DEBUG] Worker retrieved from {job['start_min']} to {job['end_min']}")
 
                 break  # success, exit loop
             
-            except RateLimitError:
-                time.sleep(0.5)
-                continue  # retry same job
             except Exception as e:
                 retries += 1
-                print(f"[Worker] Job {job} failed with exception: {e}, retry {retries}")
+                print(f"[_run_job DEBUG] Job {job} failed with exception: {e}, retry {retries}")
                 if retries >= max_retries:
-                    print(f"[Worker] Job {job} exceeded max retries, skipping")
+                    print(f"[_run_job DEBUG] Job {job} exceeded max retries, skipping")
                     break
             finally:
                 self._semaphore.release()
 
-
     def submit_all(self, jobs: List[Dict[str, Any]]):
         """Submit all jobs at once and wait for completion."""
-        if self._started:
-            raise RuntimeError("WorkerPool already started")
-        self._started = True
 
         # Submit all jobs to the executor
         futures = [self._execution.submit(self._run_job, job) for job in jobs]
@@ -213,7 +144,6 @@ if __name__ == "__main__":
     import threading
     from binance.concurrency.network.client_http import HttpClient
     from binance.concurrency.network.spot_throttle import spot_throttle, SpotWeights
-    from binance.concurrency.network.rtt import RoundTimeTripEMA
     from binance.concurrency.orchestration.autoscaler import Autoscaler
     from binance.concurrency.orchestration.pool import WorkerPool
     from binance.concurrency.orchestration.jobs import job_generator, build_kline_request, parse_dates
@@ -228,36 +158,21 @@ if __name__ == "__main__":
     # --- Throttle ---
     throttle = spot_throttle(max_weight_minute=5999, window_s=60)
 
-    # --- RTT EMA ---
-    rtt_ema = RoundTimeTripEMA(alpha=0.7)
-    def rtt_update(elapsed_ms: float):
-        return rtt_ema(elapsed_ms)
-
     # --- Result collection & worker tracking ---
     results = []
     results_lock = threading.Lock()
-    _active_workers = 0
-    _min_workers = float('inf')
-    _max_workers = 0
-    active_lock = threading.Lock()
     rtts = []
-
+    
+    def append_result(res, job):
+        results.append((job['start_min'], job['end_min'], res.elapsed_ms))
+        rtts.append(res.elapsed_ms)
+    
+    # Process results with a lock to avoid workers conflict
     def process_result(res, job):
-        global _active_workers, _min_workers, _max_workers
-        with active_lock:
-            _active_workers = pool._granted_permits
-            _min_workers = min(_min_workers, _active_workers)
-            _max_workers = max(_max_workers, _active_workers)
         with results_lock:
-            results.append((job['start_min'], job['end_min'], res.elapsed_ms))
-            rtts.append(res.elapsed_ms)
+            append_result(res, job)
     
     results.sort(key=lambda x: x[0])  # x[0] is start_min
-    # Now `results` is guaranteed to be in chronological order
-    for r in results:
-        start_min, end_min, elapsed_ms = r
-        print(f"{start_min}→{end_min}, RTT={elapsed_ms:.2f} ms")
-        # print(f"Processed job {job['start_min']}→{job['end_min']} ms RTT={res.elapsed_ms:.2f} | Active workers: {_active_workers}")
 
     # --- Autoscaler ---
     autoscaler = Autoscaler(throttle=throttle, min_workers= 1, max_workers= 20)
@@ -273,29 +188,64 @@ if __name__ == "__main__":
     start_min = parse_dates(start_date)
     end_min = parse_dates(end_date)
     jobs = list(job_generator(symbol, interval, start_min, end_min, per_request_limit=1000))
+    total_klines = len(jobs) * 1000
 
-    print(f"Submitting {len(jobs)} jobs...")
+    max_threads = 20
 
+    warmup_jobs = 25
+    warmup_batch, remaining = jobs[:warmup_jobs], jobs[warmup_jobs:] 
+    
+    def run_warmup(batch):
+        rtt = []
+        for job in batch:
+            throttle.acquire(SpotWeights.KLINES)
+            path, params = build_kline_request(job)
+            res = http.get(path, params=params)
+            rtt.append(res.elapsed_ms)
+            append_result(res, job)
+        return np.mean(rtt) / 1000
+    
+    rtt_s = run_warmup(warmup_batch)
+    target_workers = min(scale_func(rtt_s), max_threads) 
+    
+    print("Warm up batch starting... ")
+    print(" ")
+    print(f"Retrieving {total_klines} klines from {start_date} to {end_date}")
+    print(f"Retrieving {jobs} batches")
+    print(" ")
+    print(f"Average Round Time Trip over {warmup_jobs} jobs is {rtt_s} seconds")
+    print(f"Number of target workers based on the average RTT is {target_workers}")
+    print(" ")
+    print("Warm up batch ended")
+    print(" ")
+    
     # --- Initialize WorkerPool ---
     pool = WorkerPool(
         http= http,
         throttle= throttle,
-        rtt_update= rtt_update,
         request_builder= build_kline_request,
         response= process_result,
-        autoscale= scale_func,
         weight_per_request= SpotWeights.KLINES,
-        max_threads= 20,
-        initial_concurrency= 1,
-        autoscale_trigger= 10
+        max_threads= max_threads,
+        initial_concurrency= target_workers
     )
 
+    print(f"Remaining batches: {remaining}")
+    print("Workers pool starting...")
+    print(" ")
+
     # --- Run jobs ---
-    pool.submit_all(jobs)
+    pool.submit_all(remaining)
     pool.shutdown()
+    
+    for r in results:
+        start_min, end_min, elapsed_ms = r
+        print(f"{start_min}→{end_min}, RTT={elapsed_ms:.2f} s")
 
     end_time = datetime.datetime.now()
     delta = end_time - start_time
+    print("Workers pool ended")
+    print(" ")
 
     # --- Stats ---
     total_jobs = len(results)
@@ -305,8 +255,5 @@ if __name__ == "__main__":
     print("\nAll jobs completed!")
     print(f"Total Time: {delta}")
     print(f"Total Jobs Processed: {total_jobs}")
-    print(f"Min workers used: {_min_workers}")
-    print(f"Max workers used: {_max_workers}")
-    print(f"Average RTT: {avg_rtt:.2f} ms")
     print(f"Throughput: {throughput:.2f} jobs/sec")
     # print(f"Results: {results}")
