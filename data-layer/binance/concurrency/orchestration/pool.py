@@ -78,7 +78,6 @@ class WorkerPool:
 
         while True:
             try:    
-                print(f"[_run_job DEBUG] Acquire semaphore permit: Granted={self._granted_permits}")
                 # Acquire concurrency permit
                 self._semaphore.acquire()
                 
@@ -97,14 +96,14 @@ class WorkerPool:
 
                 # Retrieve round time trip in seconds
                 try:
-                    rtt_s = (result.elapsed_ms) / 1000
+                    rtt_s = (result.elapsed_ms)
                 except Exception:
                     rtt_s = None
 
                 # Process the result
                 self.response(result, job)
 
-                print(f"[_run_job DEBUG] Job completed in {rtt_s} seconds.")
+                print(f"[_run_job DEBUG] Job completed in {rtt_s:.2f} seconds.")
                 print(" ")
                 print(f"[_run_job DEBUG] Worker retrieved from {job['start_min']} to {job['end_min']}")
 
@@ -148,7 +147,7 @@ if __name__ == "__main__":
     from binance.concurrency.orchestration.pool import WorkerPool
     from binance.concurrency.orchestration.jobs import job_generator, build_kline_request, parse_dates
 
-    print("Running mini end-to-end WorkerPool test...")
+    print("Running Pool test...")
     start_time = datetime.datetime.now()
 
     # --- Transport ---
@@ -181,8 +180,8 @@ if __name__ == "__main__":
 
     # --- Jobs ---
     symbol = "BTCUSDT"
-    interval = "5m"
-    start_date = "2024-01-01 00:00"
+    interval = "1m"
+    start_date = "2023-01-01 00:00"
     end_date   = "2025-01-01 00:00"
 
     start_min = parse_dates(start_date)
@@ -191,7 +190,10 @@ if __name__ == "__main__":
     total_klines = len(jobs) * 1000
 
     max_threads = 20
-
+    
+    print("Warm up batch starting... ")
+    print(" ")
+    
     warmup_jobs = 25
     warmup_batch, remaining = jobs[:warmup_jobs], jobs[warmup_jobs:] 
     
@@ -203,19 +205,11 @@ if __name__ == "__main__":
             res = http.get(path, params=params)
             rtt.append(res.elapsed_ms)
             append_result(res, job)
-        return np.mean(rtt) / 1000
+        return np.mean(rtt) 
     
     rtt_s = run_warmup(warmup_batch)
     target_workers = min(scale_func(rtt_s), max_threads) 
     
-    print("Warm up batch starting... ")
-    print(" ")
-    print(f"Retrieving {total_klines} klines from {start_date} to {end_date}")
-    print(f"Retrieving {jobs} batches")
-    print(" ")
-    print(f"Average Round Time Trip over {warmup_jobs} jobs is {rtt_s} seconds")
-    print(f"Number of target workers based on the average RTT is {target_workers}")
-    print(" ")
     print("Warm up batch ended")
     print(" ")
     
@@ -230,20 +224,18 @@ if __name__ == "__main__":
         initial_concurrency= target_workers
     )
 
-    print(f"Remaining batches: {remaining}")
+    print(f"Remaining batches: {len(remaining)}")
     print("Workers pool starting...")
     print(" ")
 
     # --- Run jobs ---
     pool.submit_all(remaining)
     pool.shutdown()
-    
-    for r in results:
-        start_min, end_min, elapsed_ms = r
-        print(f"{start_min}→{end_min}, RTT={elapsed_ms:.2f} s")
 
     end_time = datetime.datetime.now()
     delta = end_time - start_time
+
+    print(" ")
     print("Workers pool ended")
     print(" ")
 
@@ -253,7 +245,10 @@ if __name__ == "__main__":
     throughput = total_jobs / delta.total_seconds() if delta.total_seconds() > 0 else 0.0
 
     print("\nAll jobs completed!")
-    print(f"Total Time: {delta}")
-    print(f"Total Jobs Processed: {total_jobs}")
+    print(" ")
+    print(f"Average round time trip over {warmup_jobs} jobs is {rtt_s:.2f} seconds")
+    print(f"Number of target workers based on the average RTT is {target_workers}")
+    print(f"Total time: {delta}")
+    print(f"Total jobs processed: {total_jobs}")
+    print(f"Total klines retrieved: {total_klines}")
     print(f"Throughput: {throughput:.2f} jobs/sec")
-    # print(f"Results: {results}")

@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import time
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Any, Dict, List, Tuple, Optional
 
 import polars as pl
 import os
 import logging
+import threading
+import numpy as np
 
 from binance.concurrency.network.client_http import HttpClient, HttpResult, HttpError, RateLimitError
 from binance.concurrency.orchestration.pool import WorkerPool
@@ -15,11 +17,8 @@ from binance.concurrency.orchestration.autoscaler import Autoscaler
 from binance.concurrency.orchestration.jobs import (                            
     job_generator,
     build_kline_request,
-    parse_dates,
-    INTERVAL_MIN,
+    parse_dates
 )
-
-from binance.concurrency.network.rtt import RoundTimeTripEMA
 
 # --- Small helper: parse Binance kline rows into dicts ---------------------------------
 # Binance /api/v3/klines returns list of rows shaped like:
@@ -81,12 +80,12 @@ def get_klines(
     interval: str,
     start_date: str,     # e.g. "2025-01-01 00:00"
     end_date: str,       # e.g. "2025-01-02 00:00"
-    out_parquet_path: Optional[str] = None,
+    path: Optional[str] = None,
     per_request_limit: int = 1000,
 ):
     """
     Download Spot klines via REST, aggregate into a Polars DataFrame,
-    and write a Parquet file if `out_parquet_path` is provided.
+    and write a Parquet file if `path` is provided.
 
     Returns (df, parquet_path) where parquet_path is the written path (or
     a default suggestion if not provided).
@@ -113,63 +112,75 @@ def get_klines(
         backoff_factor= 2,
         default_headers= None
     )
-
+    
     throttle = spot_throttle(
-        max_weight_minute= 5990,
+        max_weight_minute= 5999,
         window_s= 60,
         clock= time.monotonic,
         min_sleep= 2.0
     )
+    
+    # Generate jobs
+    jobs = list(job_generator(
+        symbol= symbol,
+        interval= interval,
+        start_min= start_min,
+        end_min= end_min,
+        per_request_limit= per_request_limit,
+    ))
 
-    # RTT EMA + autoscaler hook     
-    rtt_ema = RoundTimeTripEMA(alpha=0.7)
-    def rtt_update_ms(elapsed_ms: float):
-        # Your EMA expects seconds in your examples; convert ms->s
-        return rtt_ema(elapsed_ms)
+    # Define the autoscaler function
+    autoscaler = Autoscaler(throttle= throttle, min_workers= 1, max_workers= 50)
+    def scale_func(rtt_s: float):
+        return autoscaler.workers(rtt_s)
 
     # Result collection (thread-safe)
     results: List[Dict[str, Any]] = []
     results_lock = __import__("threading").Lock()
 
     def process_result(res: HttpResult, job: Dict[str, Any]):
-        # Parse kline rows and append
         rows = res.data if isinstance(res.data, list) else []
         parsed = _rows_to_dicts(job["symbol"], job["interval"], rows)
         if parsed:
             with results_lock:
                 results.extend(parsed)
             logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-            logging.info(f"Processed {len(parsed)} rows for job {job['symbol']}")
+            logging.info(f"Processed {len(parsed)} rows for job {job['symbol']}\
+                         from {job['start_min']} to {job['end_min']}")
 
-    jobs = list(job_generator(
-        symbol=symbol,
-        interval=interval,
-        start_min=start_min,
-        end_min=end_min,
-        per_request_limit=per_request_limit,
-    ))
+    total_klines = len(jobs) * 1000
 
-    # --- Autoscaler ---
-    autoscaler = Autoscaler(throttle=throttle, min_workers= 1, max_workers= 50)
-    def scale_func(rtt_s: float):
-        return autoscaler.workers(rtt_s)
+    max_threads = 20
+
+    warmup_jobs = 25
+    warmup_batch, remaining = jobs[:warmup_jobs], jobs[warmup_jobs:] 
+    
+    def run_warmup(batch):
+        rtt = []
+        for job in batch:
+            throttle.acquire(SpotWeights.KLINES)
+            path, params = build_kline_request(job)
+            res = http.get(path, params=params)
+            rtt.append(res.elapsed_ms)
+            process_result(res, job)
+        return np.mean(rtt) 
+    
+    rtt_s = run_warmup(warmup_batch)
+    target_workers = min(scale_func(rtt_s), max_threads)
 
     # Build WorkerPool
     pool = WorkerPool(
         http= http,
         throttle= throttle,
-        rtt_update= rtt_update_ms,
         request_builder= build_kline_request,
         response= process_result,
-        autoscale= scale_func,
         weight_per_request= SpotWeights.KLINES,
-        max_threads= 50,
-        initial_concurrency= 1,
-        autoscale_trigger= 10,
+        max_threads= max_threads,
+        initial_concurrency= target_workers
     )
     
     # Submit all jobs at once
-    pool.submit_all(jobs)
+    pool.submit_all(remaining)
     pool.shutdown()
 
     # Build Polars DataFrame + sort/dedupe --------------------------------
@@ -198,12 +209,18 @@ def get_klines(
         df = df.sort(["open_time"])
         # df = parse(df)
     
-    output_directory = os.path.expanduser("~/hedge-room/data/binance/spot") # python standard library function that replaces the ~ with the path to the current user’s home directory
-    os.makedirs(output_directory, exist_ok=True) # ensures the directory exists
-    out_parquet_path = os.path.join(output_directory, "btc_1m_20200101_20251014.parquet") # append the file name to the directory
- 
-    df.write_parquet(out_parquet_path) # polar method to used to save df in parquet format 
-    return df , out_parquet_path
+    start_label = datetime.datetime.fromisoformat(start_date).strftime("%Y%m%d-%H%M")
+    end_label = datetime.datetime.fromisoformat(end_date).strftime("%Y%m%d-%H%M")
+
+    directory = os.path.expanduser(path)
+    os.makedirs(directory, exist_ok=True)
+    out_parquet_path = os.path.join(directory, f"{symbol}_{interval}_{start_label}_{end_label}.parquet")
+
+    df.write_parquet(out_parquet_path) # parquet format 
+    
+    return df , out_parquet_path,\
+        total_klines, warmup_jobs,\
+        rtt_s, target_workers
 
 # Example: BTCUSDT 1m, one day
 if __name__ == "__main__":
@@ -212,17 +229,32 @@ if __name__ == "__main__":
 
     start_time = datetime.datetime.now()
 
-    SYMBOL = "ETHUSDT"
+    SYMBOL = "BTCUSDT"
     INTERVAL = "1m"
     START = "2024-01-01 00:00"
     END   = "2025-01-01 00:00"
+    PATH = "/home/homercrypton/hedge-room/data/binance/spot/ohlc/1m/btcusdt" 
 
-    df, path = get_klines(SYMBOL, INTERVAL, START, END, per_request_limit=1000)
+    df, path, total_klines,\
+    warmup_jobs, rtt_s,\
+    target_workers= get_klines(SYMBOL, INTERVAL, START, END, PATH, per_request_limit=1000)
+    
     print(f"Fetched {len(df)} rows → wrote {path}")
+    
     # --- Stats ---
     total_jobs = len(df)
     end_time = datetime.datetime.now()
     delta = end_time - start_time
-    print(f"Total Time: {delta}")
-    print(f"Total Jobs: {total_jobs}")
+    throughput = total_jobs / delta.total_seconds() if delta.total_seconds() > 0 else 0.0
+    
+    print("\nAll jobs completed!")
+    print(" ")
+    print(f"Average round time trip over {warmup_jobs} jobs is {rtt_s:.2f} seconds")
+    print(f"Number of target workers based on the average RTT is {target_workers}")
+    print(f"Total time: {delta}")
+    print(f"Total jobs processed: {total_jobs}")
+    print(f"Total klines retrieved: {total_klines}")
+    print(f"Throughput: {throughput:.2f} jobs/sec")
+    print(" ")
+    print(f"Parquet file located at: {path}")
     print(df.tail(5))
