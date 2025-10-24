@@ -91,21 +91,21 @@ class WorkerPool:
                 try: 
                     result = self.http.get(path, params=params)
                 except Exception as e:
-                    print(f"[_run_job DEBUG] Execution stopped - Job {job} failed with exception: {e}")
+                    # print(f"[_run_job DEBUG] Execution stopped - Job {job} failed with exception: {e}")
                     break
 
-                # Retrieve round time trip in seconds
-                try:
-                    rtt_s = (result.elapsed_ms)
-                except Exception:
-                    rtt_s = None
+                # # Retrieve round time trip in seconds
+                # try:
+                #     rtt_s = (result.elapsed_ms)
+                # except Exception:
+                #     rtt_s = None
 
                 # Process the result
                 self.response(result, job)
 
-                print(f"[_run_job DEBUG] Job completed in {rtt_s:.2f} seconds.")
-                print(" ")
-                print(f"[_run_job DEBUG] Worker retrieved from {job['start_min']} to {job['end_min']}")
+                # print(f"[_run_job DEBUG] Job completed in {rtt_s:.2f} seconds.")
+                # print(" ")
+                # print(f"[_run_job DEBUG] Worker retrieved from {job['start_min']} to {job['end_min']}")
 
                 break  # success, exit loop
             
