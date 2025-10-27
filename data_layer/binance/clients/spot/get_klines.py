@@ -61,7 +61,7 @@ def parse(df):
         df = df.with_columns(
             pl.col(col)
             .cast(pl.Datetime(time_unit="ms"))      
-            # .dt.strftime("%Y-%m-%dT%H:%M")     # ISO 8601 with literal Z
+            .dt.strftime("%Y-%m-%dT%H:%M")     # ISO 8601 with literal Z
             .alias(col)
         )
     # Separate date and time in two columns    
@@ -114,7 +114,7 @@ def get_klines(
     )
     
     throttle = spot_throttle(
-        max_weight_minute= 5999,
+        max_weight_minute= 5998,
         window_s= 60,
         clock= time.monotonic,
         min_sleep= 2.0
@@ -207,7 +207,7 @@ def get_klines(
         df = pl.DataFrame(results)
         # Sort by open time
         df = df.sort(["open_time"])
-        df = parse(df)
+        # df = parse(df)
     
     start_label = datetime.datetime.fromisoformat(start_date).strftime("%Y%m%d-%H%M")
     end_label = datetime.datetime.fromisoformat(end_date).strftime("%Y%m%d-%H%M")
@@ -231,7 +231,7 @@ if __name__ == "__main__":
 
     SYMBOL = ["BTCUSDT", "ETHUSDT"] # add all the binance symbols to download 
     INTERVAL = "5m"
-    START = "2024-01-01 00:00"
+    START = "2024-10-01 00:00"
     END   = "2025-01-01 00:00" 
     
     for ticker in SYMBOL:
@@ -267,4 +267,5 @@ if __name__ == "__main__":
     end = datetime.datetime.now()
     delta = end - start
     print(" ")
+    print(df.columns)
     print(f"All data were correctly retrieved in {delta}!")
