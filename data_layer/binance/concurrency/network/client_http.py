@@ -175,6 +175,12 @@ class HttpClient:
             
             # Edit the code to handle the case where there is a connection error and then it starts again resetting backoff
             status = response.status_code # check the response status code
+            if not status:
+                self.rotate_host()
+                if attempts > self.max_retries:
+                    raise HttpError(f"Network error after {attempts} attempts: {e}",
+                                    url=url, status=None, host=host, attempt=attempts)
+                self.sleep_backoff(attempts)
             hdrs = {k.lower(): v for k, v in response.headers.items()} # lower-case keys
             body_text = response.text or "" # extract the body of the http response or empty string if no body
 
