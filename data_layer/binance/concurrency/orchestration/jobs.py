@@ -136,15 +136,21 @@ def job_generator(
         cursor = next_
 
 # ---- Request builder: convert MINUTES -> MILLISECONDS right before send ----
-def build_kline_request(job: Dict[str, Any]):
+def build_kline_request(job: Dict[str, Any], type:str):
     """
     Turn a minute-based job into a Binance REST request in ms.
     """
     start_ms = int(job["start_min"]) * 60_000
     end_ms = int(job["end_min"]) * 60_000
+    
+    if type == "spot":
+        path = "/api/v3/klines"
+    elif type == "future":
+        path = "/fapi/v1/klines"
+        
     return (
         # path
-        "/api/v3/klines",
+        path,
         # params
         {
             "symbol": job["symbol"],

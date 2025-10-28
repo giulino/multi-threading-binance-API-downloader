@@ -47,7 +47,8 @@ class WorkerPool:
             response: Callable[[HttpResult, Dict[str, Any]], None],  # handles response
             weight_per_request: int = SpotWeights.KLINES,  # Binance weight per request (default 2)
             max_threads: int = 100,  # maximum thread count
-            initial_concurrency: int = 1  # initial active workers
+            initial_concurrency: int = 1,  # initial active workers
+            market_type: str = "spot"
         ):
 
         # ---- Assign injected dependencies ----
@@ -56,6 +57,7 @@ class WorkerPool:
         self.request_builder = request_builder
         self.response = response
         self.weight = int(weight_per_request)
+
 
         # ---- Internal infrastructure 
         self._execution = ThreadPoolExecutor(max_workers=int(max_threads), thread_name_prefix="wrkr")  # thread pool
@@ -66,6 +68,9 @@ class WorkerPool:
     
         # ---- Runtime state ----
         self._max_threads = int(max_threads)
+
+        # type of data
+        self._market_type = market_type
     
     # ======================
     # Worker Execution Loop
@@ -75,7 +80,6 @@ class WorkerPool:
         """Run a single job for a fixed number of workers"""
         
         retries = 0
-
         while True:
             try:    
                 # Acquire concurrency permit
@@ -85,7 +89,7 @@ class WorkerPool:
                 self.throttle.acquire(self.weight)
 
                 # Build request
-                path, params = self.request_builder(job)
+                path, params = self.request_builder(job, self._market_type)
 
                 # Send request
                 try: 

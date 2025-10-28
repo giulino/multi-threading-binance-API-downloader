@@ -8,6 +8,10 @@ class SpotWeights:
       """Endpoint weights for Binance Spot REST."""
       KLINES = 2
 
+class PerpFuturesWeights:  
+      """Endpoint weights for Binance Perpetual Futures REST."""
+      KLINES = 2
+
 class spot_throttle:
 
     """
