@@ -1,4 +1,4 @@
-from binance.concurrency.network.spot_throttle import spot_throttle, SpotWeights
+from concurrency.orchestration.spot_throttle import spot_throttle, SpotWeights
 
 from math import floor
 

@@ -84,7 +84,7 @@ def total_jobs(
     total_candles = max(0, (end - start) // step)
     jobs = ceil(total_candles / per_request_limit)
     
-    return jobs, start, end
+    return jobs
 
 # ---- Job generator: one yielded dict == one REST call (one job) ----
 def job_generator(
@@ -145,8 +145,10 @@ def build_kline_request(job: Dict[str, Any], type:str):
     
     if type == "spot":
         path = "/api/v3/klines"
-    elif type == "future":
+    elif type == "usd_future":
         path = "/fapi/v1/klines"
+    elif type == "coin_future":
+        path = "/dapi/v1/klines"
         
     return (
         # path

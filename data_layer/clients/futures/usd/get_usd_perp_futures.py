@@ -9,11 +9,11 @@ import logging
 import threading
 import numpy as np
 
-from binance.concurrency.network.client_http import HttpClient, HttpResult
-from binance.concurrency.orchestration.pool import WorkerPool
-from binance.concurrency.orchestration.spot_throttle import spot_throttle, PerpFuturesWeights
-from binance.concurrency.orchestration.autoscaler import Autoscaler
-from binance.concurrency.orchestration.jobs import (                            
+from concurrency.network.client_http import HttpClient, HttpResult
+from concurrency.orchestration.pool import WorkerPool
+from concurrency.orchestration.spot_throttle import spot_throttle, PerpFuturesWeights
+from concurrency.orchestration.autoscaler import Autoscaler
+from concurrency.orchestration.jobs import (                            
     job_generator,
     build_kline_request,
     parse_dates,
@@ -139,7 +139,7 @@ def get_klines(
     # Calculate total jobs
     total_Jobs = total_jobs(start_min, end_min, interval, per_request_limit)
 
-    warmup_jobs = 50
+    warmup_jobs = 25
     warmup_batch, remaining = jobs[:warmup_jobs], jobs[warmup_jobs:] 
     
     # Define warmup function to calculate rtt
@@ -226,7 +226,8 @@ def get_klines(
     
     return df, out_parquet_path,\
         warmup_jobs,\
-        rtt_s, target_workers, total_Jobs\
+        rtt_s, target_workers,\
+        total_Jobs
 
 # Example: BTCUSDT 1m, one day
 if __name__ == "__main__":
@@ -235,9 +236,9 @@ if __name__ == "__main__":
 
     REQUEST_LIMIT = 500 
 
-    SYMBOL = ["BTCUSDT", "ETHUSDT"] # add binance symbols to download 
-    INTERVAL = "1d"
-    START = "2022-01-01 00:00"
+    SYMBOL = ["ETHUSDT"] # add binance symbols to download 
+    INTERVAL = "1m"
+    START = "2024-01-01 00:00"
     END   = "2025-01-01 00:00"
 
     
@@ -264,6 +265,7 @@ if __name__ == "__main__":
             print(f"Number of target workers based on the average RTT is {target_workers}")
         print(f"Total time: {delta}")
         print(f"Total klines processed: {total_klines}")
+        print(f"Total requests processed: {total_Jobs}")
         print(f"Throughput: {int(throughput)} klines/sec")
         print(" ")
         print(f"Parquet file located at: {parquet_path}")

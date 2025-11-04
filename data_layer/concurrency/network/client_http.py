@@ -8,11 +8,7 @@ import logging
 from typing import Any, Dict, Optional, Iterable
 
 
-# ------------- Errors Management -------------
-
-# Custom exception class that inherits from Python’s built-in Exception class
-# It behaves like any other Python error but with extra info defined
-
+# Errors Management
 class HttpError(Exception):
     """Generic HTTP error connection"""
     def __init__(self, 
@@ -127,7 +123,10 @@ class HttpClient:
         # simple exponential backoff with a tiny jitter
         base = self.backoff_base_s * (self.backoff_factor ** (attempt - 1))
         jitter = random.uniform(0.0, 0.1) # de-synchronized retries across clients
-        return min(base + jitter, 8.0)
+        total = base + jitter
+        print(f"Sleep for: {total} seconds")
+        
+        return min(total, 8.0)
 
     def sleep_backoff(self, attempt: int):
         time.sleep(self.backoff_seconds(attempt))
@@ -138,8 +137,7 @@ class HttpClient:
             merged.update(headers)
         return merged
 
-    # ------------- Internal Logic -------------
-
+    #Build request
     def _request(self, 
                 method: str, 
                 path: str, 
@@ -210,6 +208,7 @@ class HttpClient:
             # 5xx server side errors: rotate host
             if 500 <= status < 600:
                 self.rotate_host()
+                logging.info("Rotating host")
                 if attempts > self.max_retries:
                     raise HttpError(f"Server error {status} (retries exhausted)",
                                     url=url, status=status, host=host, 
@@ -232,7 +231,6 @@ class HttpClient:
         
         return self._request("GET", path, params=params, headers=headers)
     
-
 if __name__ == "__main__":
     import logging
 

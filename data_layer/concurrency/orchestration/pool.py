@@ -2,15 +2,14 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 import threading
-import time
 import numpy as np
 
-from typing import Optional, Callable, Any, Tuple, Dict, List
+from typing import Callable, Any, Tuple, Dict, List
 
 # import project dependencies
-from binance.concurrency.network.client_http import HttpClient, HttpResult
-from binance.concurrency.network.spot_throttle import spot_throttle, SpotWeights
-from binance.concurrency.orchestration.autoscaler import Autoscaler
+from concurrency.network.client_http import HttpClient, HttpResult
+from concurrency.orchestration.spot_throttle import spot_throttle, SpotWeights
+from concurrency.orchestration.autoscaler import Autoscaler
 
 class WorkerPool:
     """
@@ -98,18 +97,8 @@ class WorkerPool:
                     # print(f"[_run_job DEBUG] Execution stopped - Job {job} failed with exception: {e}")
                     break
 
-                # # Retrieve round time trip in seconds
-                # try:
-                #     rtt_s = (result.elapsed_ms)
-                # except Exception:
-                #     rtt_s = None
-
                 # Process the result
                 self.response(result, job)
-
-                # print(f"[_run_job DEBUG] Job completed in {rtt_s:.2f} seconds.")
-                # print(" ")
-                # print(f"[_run_job DEBUG] Worker retrieved from {job['start_min']} to {job['end_min']}")
 
                 break  # success, exit loop
             
@@ -145,11 +134,11 @@ if __name__ == "__main__":
     import time
     import datetime
     import threading
-    from binance.concurrency.network.client_http import HttpClient
-    from binance.concurrency.network.spot_throttle import spot_throttle, SpotWeights
-    from binance.concurrency.orchestration.autoscaler import Autoscaler
-    from binance.concurrency.orchestration.pool import WorkerPool
-    from binance.concurrency.orchestration.jobs import job_generator, build_kline_request, parse_dates
+    from concurrency.network.client_http import HttpClient
+    from data_layer.concurrency.orchestration.spot_throttle import spot_throttle, SpotWeights
+    from concurrency.orchestration.autoscaler import Autoscaler
+    from concurrency.orchestration.pool import WorkerPool
+    from concurrency.orchestration.jobs import job_generator, build_kline_request, parse_dates
 
     print("Running Pool test...")
     start_time = datetime.datetime.now()
@@ -179,8 +168,7 @@ if __name__ == "__main__":
 
     # --- Autoscaler ---
     autoscaler = Autoscaler(throttle=throttle, min_workers= 1, max_workers= 20)
-    def scale_func(rtt_s: float):
-        return autoscaler.workers(rtt_s)
+
 
     # --- Jobs ---
     symbol = "BTCUSDT"
@@ -191,7 +179,7 @@ if __name__ == "__main__":
     start_min = parse_dates(start_date)
     end_min = parse_dates(end_date)
     jobs = list(job_generator(symbol, interval, start_min, end_min, per_request_limit=1000))
-    total_klines = len(jobs) * 1000
+
 
     max_threads = 20
     
@@ -212,7 +200,7 @@ if __name__ == "__main__":
         return np.mean(rtt) 
     
     rtt_s = run_warmup(warmup_batch)
-    target_workers = min(scale_func(rtt_s), max_threads) 
+    target_workers = min(autoscaler.workers(rtt_s), max_threads) 
     
     print("Warm up batch ended")
     print(" ")
@@ -244,15 +232,15 @@ if __name__ == "__main__":
     print(" ")
 
     # --- Stats ---
-    total_jobs = len(results)
+    total_klines = len(results)
     avg_rtt = sum(rtts)/len(rtts) if rtts else 0.0
-    throughput = total_jobs / delta.total_seconds() if delta.total_seconds() > 0 else 0.0
+    throughput = total_klines / delta.total_seconds() if delta.total_seconds() > 0 else 0.0
 
     print("\nAll jobs completed!")
     print(" ")
     print(f"Average round time trip over {warmup_jobs} jobs is {rtt_s:.2f} seconds")
     print(f"Number of target workers based on the average RTT is {target_workers}")
     print(f"Total time: {delta}")
-    print(f"Total jobs processed: {total_jobs}")
+    # print(f"Total jobs processed: {total_klines}")
     print(f"Total klines retrieved: {total_klines}")
-    print(f"Throughput: {throughput:.2f} jobs/sec")
+    print(f"Throughput: {int(throughput)} jobs/sec")

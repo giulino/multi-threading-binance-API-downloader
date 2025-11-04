@@ -9,11 +9,11 @@ import logging
 import threading
 import numpy as np
 
-from binance.concurrency.network.client_http import HttpClient, HttpResult
-from binance.concurrency.orchestration.pool import WorkerPool
-from binance.concurrency.orchestration.spot_throttle import spot_throttle, PerpFuturesWeights
-from binance.concurrency.orchestration.autoscaler import Autoscaler
-from binance.concurrency.orchestration.jobs import (                            
+from concurrency.network.client_http import HttpClient, HttpResult
+from concurrency.orchestration.pool import WorkerPool
+from concurrency.orchestration.spot_throttle import spot_throttle, PerpFuturesWeights
+from concurrency.orchestration.autoscaler import Autoscaler
+from concurrency.orchestration.jobs import (                            
     job_generator,
     build_kline_request,
     parse_dates,
@@ -235,9 +235,9 @@ if __name__ == "__main__":
 
     REQUEST_LIMIT = 500
 
-    SYMBOL = ["BTCUSD_PERP", "ETHUSD_PERP"] # add all the binance symbols to download 
-    INTERVAL = "1d"
-    START = "2024-12-01 00:00"
+    SYMBOL = ["BTCUSD_PERP"] # add all the binance symbols to download 
+    INTERVAL = "1m"
+    START = "2024-01-01 00:00"
     END   = "2025-01-01 00:00"
 
     
@@ -265,7 +265,7 @@ if __name__ == "__main__":
             print(f"Number of target workers based on the average RTT is {target_workers}")
         print(f"Total time: {delta}")
         print(f"Total klines processed: {total_klines}")
-        print(f"Total requests processed: {total_Jobs}")
+        20
         print(f"Throughput: {int(throughput)} klines/sec")
         print(" ")
         print(f"Parquet file located at: {parquet_path}")
