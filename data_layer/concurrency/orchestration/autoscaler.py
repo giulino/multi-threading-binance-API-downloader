@@ -1,11 +1,10 @@
-from concurrency.orchestration.spot_throttle import spot_throttle, SpotWeights
-
+from concurrency.network.client_throttle import Throttle_, SpotWeights
 from math import floor
 
 class Autoscaler:
     def __init__(
             self,
-            throttle: spot_throttle, # stateful object tracking relevant information
+            throttle: Throttle_,
             min_workers: int = 1,
             max_workers: int = 100,
     ):
@@ -16,22 +15,24 @@ class Autoscaler:
 
     def workers(self, rtt_s: float):
 
-        # Define the total request per minute
+        """
+        Method used to calculate workers based on the average round
+        time trip calculate in the first n requests
+        """
+
         request_minute = self.throttle.max_weight_minute / SpotWeights.KLINES
 
-        # Calculate total workers 
         tot_workers = floor(request_minute / (60 / rtt_s))
     
         return min(max(tot_workers, self.min_workers), self.max_workers)
 
 
 if __name__ == "__main__":
-    import time
 
     print("Testing Autoscaler...")
 
-    # Create a fake spot_throttle with a low max weight for testing
-    throttle = spot_throttle(max_weight_minute=10, window_s=60)
+    # Create a fake throttle with a low max weight for testing
+    throttle = Throttle_(max_weight_minute=2, window_s=60)
 
     # Create Autoscaler
     autoscaler = Autoscaler(throttle=throttle, min_workers=1, max_workers=50)

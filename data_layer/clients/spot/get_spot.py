@@ -11,7 +11,7 @@ import numpy as np
 
 from concurrency.network.client_http import HttpClient, HttpResult
 from concurrency.orchestration.pool import WorkerPool
-from concurrency.orchestration.spot_throttle import spot_throttle, SpotWeights
+from concurrency.network.client_throttle import Throttle_, SpotWeights
 from concurrency.orchestration.autoscaler import Autoscaler
 from concurrency.orchestration.jobs import (                            
     job_generator,
@@ -52,19 +52,18 @@ def parse(df):
     Convert `open_time` and `close_time` columns (seconds since epoch) 
     to ISO 8601 format strings.
     """
-    # Converte columns from milliseconds to ISO 8601
+
     for col in ["open_time", "close_time"]:
         df = df.with_columns(
             pl.col(col)
             .cast(pl.Datetime(time_unit="ms"))      
             .alias(col)
         )
-    # Separate date and time in two columns    
+   
     df = df.with_columns(pl.col("open_time").dt.strftime("%Y-%m-%d").alias('Date'))
     df = df.with_columns(pl.col("open_time").dt.strftime("%H:%M").alias('open_time_only'))
     df = df.with_columns(pl.col("close_time").dt.strftime("%H:%M").alias('close_time_only'))
     
-    # Drop old columns
     df = df.drop(["open_time", "close_time"])
 
     return df 
@@ -86,7 +85,6 @@ def get_klines(
     a default suggestion if not provided).
     """
     
-    # Convert dates in absolute minutes (UTC)
     start_min = parse_dates(start_date)
     end_min   = parse_dates(end_date)
 
@@ -108,25 +106,27 @@ def get_klines(
         default_headers= None
     )
     
-    throttle = spot_throttle(
+    throttle = Throttle_(
         max_weight_minute= 5998,
         window_s= 60,
         clock= time.monotonic,
         min_sleep= 2.0
     )
+
+    # Calculate total jobs
+    total_Jobs, aligned_start, aligned_end = total_jobs(start_min, end_min, interval, per_request_limit)
     
     # Generate jobs
     jobs = list(job_generator(
         symbol= symbol,
         interval= interval,
-        start_min= start_min,
-        end_min= end_min,
+        start_min= aligned_start,
+        end_min= aligned_end,
         per_request_limit= per_request_limit,
     ))
 
     # Define autoscaler function
     autoscaler = Autoscaler(throttle= throttle, min_workers= 1, max_workers= 50)
-
 
     # Result collection 
     results: List[Dict[str, Any]] = []
@@ -141,9 +141,6 @@ def get_klines(
             logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
             logging.info(f"Processed {len(parsed)} rows for job {job['symbol']}\
                          from {job['start_min']} to {job['end_min']}")
-    
-    # Calculate total jobs
-    total_Jobs = total_jobs(start_min, end_min, interval, per_request_limit)
 
     warmup_jobs = 25
     warmup_batch, remaining = jobs[:warmup_jobs], jobs[warmup_jobs:] 
@@ -234,7 +231,7 @@ def get_klines(
         rtt_s, target_workers,\
         total_Jobs
 
-# Example: BTCUSDT 1m, one day
+# Example: BTCUSDT 1m, one year
 if __name__ == "__main__":
 
     start = datetime.now()

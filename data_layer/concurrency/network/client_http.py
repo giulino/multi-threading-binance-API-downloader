@@ -18,8 +18,7 @@ class HttpError(Exception):
             host : str,
             attempt : int, 
             body : str = ""):
-        super().__init__(msg) # calls the constructor of the parent class 
-                              # so that the base Python error also receives the message string
+        super().__init__(msg)
         
         self.msg = msg
         self.url = url
@@ -45,8 +44,7 @@ class HttpResult:
     url: str
     host: str
 
-# ------------- Client -------------
-
+# Client
 class HttpClient:
     """
     Http client equipped with 
@@ -58,12 +56,12 @@ class HttpClient:
 
     def __init__(
             self,
-            hosts: Iterable[str], # list of binance endpoints
-            connection_timeouts_s: float = 9.0, # max time to wait to establish a TCP connection
-            read_timeouts_s: float = 2.0, # max time to wait for the server to reply after the connetion
-            max_retries: int = 6, # how many times to retry a failed requests before rising an error 
-            backoff_base_s: float = 0.25, # base backoff
-            backoff_factor: int = 2, # exponential backoff multiplier
+            hosts: Iterable[str],
+            connection_timeouts_s: float = 9.0,
+            read_timeouts_s: float = 2.0,
+            max_retries: int = 6,  
+            backoff_base_s: float = 0.25,
+            backoff_factor: int = 2,
             default_headers: Optional[Dict[str, str]] = None,
     ):
         hosts = list(hosts)
@@ -71,20 +69,18 @@ class HttpClient:
             raise ValueError("HttpClient requires at least one base host")
         
         self.hosts = deque(hosts)
-        self.session = requests.Session() # creates a persistent http session 
+        self.session = requests.Session() 
         self.timeout = (connection_timeouts_s, read_timeouts_s)
         self.max_retries = max_retries
         self.backoff_base_s = backoff_base_s
         self.backoff_factor = backoff_factor
         self.default_headers = default_headers or {}
 
-    # ------------- Inner Functions -------------
-    
-    # Normalize URLs
+    # Inner Functions
+ 
     @staticmethod
     def full_url(host: str, path: str):
-        
-        """Static function to avoid bugs on missing slashes"""
+        """Static Method to avoid bugs on missing slashes"""
 
         if path.startswith("http://") or path.startswith("https://"):
             return path
@@ -94,8 +90,10 @@ class HttpClient:
     
     @staticmethod
     def parse_payload(response: requests.Response):
-        """Helper function deciding how to interpret the server’s response body, 
-           depending on its Content-Type header"""
+        """
+        Helper Method deciding how to interpret the server’s response body, 
+        depending on its Content-Type header
+        """
         
         type = response.headers.get("Content-Type", "")
         if "application/json" in type:
@@ -107,6 +105,8 @@ class HttpClient:
     
     @staticmethod
     def retry_after_seconds(headers: Dict[str, str]):
+        """Static Method that reads the header response"""
+
         ra = headers.get("retry-after")
         if ra is None:
             return None
@@ -115,12 +115,21 @@ class HttpClient:
         except ValueError:
             return print("The client couldn't access the response header")
 
-    def rotate_host(self) -> None:
+    def rotate_host(self):
+        """
+        Method used to change host if the first one fails to connect.
+        The failed host will be placed at the end of the list.
+        """
+
         if len(self.hosts) > 1:
             self.hosts.rotate(-1)
 
     def backoff_seconds(self, attempt: int) :
-        # simple exponential backoff with a tiny jitter
+        """
+        Method calculating the sleeping time exponentially
+        based on the number of attempts. More attempts, more sleep.            
+        """
+
         base = self.backoff_base_s * (self.backoff_factor ** (attempt - 1))
         jitter = random.uniform(0.0, 0.1) # de-synchronized retries across clients
         total = base + jitter
@@ -137,16 +146,18 @@ class HttpClient:
             merged.update(headers)
         return merged
 
-    #Build request
+    # Build request
     def _request(self, 
                 method: str, 
                 path: str, 
                 params: Optional[Dict[str, Any]], 
-                headers: Optional[Dict[str, str]]):
+                headers: Optional[Dict[str, str]]):    
+        """
+        Method that builds the http request and handle responses.
+        """
                  
         attempts = 0
         merged_headers = self._merge_headers(headers)
-        # if params is None, {} is used + remove paramas whose value is None
         qparams = {k: v for k, v in (params or {}).items() if v is not None} 
 
         while True:
@@ -163,24 +174,23 @@ class HttpClient:
                 end_time = time.perf_counter()
                 rtt = (end_time - start_time)
 
-            except (requests.ConnectionError, requests.Timeout) as e:
-                # network hiccup: rotate host and backoff 
+            except (requests.ConnectionError, requests.Timeout) as e: 
                 self.rotate_host()
                 if attempts > self.max_retries:
                     raise HttpError(f"Network error after {attempts} attempts: {e}",
                                     url=url, status=None, host=host, attempt=attempts)
                 self.sleep_backoff(attempts)
             
-            # Edit the code to handle the case where there is a connection error and then it starts again resetting backoff
-            status = response.status_code # check the response status code
+            status = response.status_code
             if not status:
                 self.rotate_host()
                 if attempts > self.max_retries:
                     raise HttpError(f"Network error after {attempts} attempts: {e}",
                                     url=url, status=None, host=host, attempt=attempts)
                 self.sleep_backoff(attempts)
-            hdrs = {k.lower(): v for k, v in response.headers.items()} # lower-case keys
-            body_text = response.text or "" # extract the body of the http response or empty string if no body
+
+            hdrs = {k.lower(): v for k, v in response.headers.items()}
+            body_text = response.text or ""
 
             if 200 <= status < 300:
                 data = self.parse_payload(response)
@@ -191,10 +201,11 @@ class HttpClient:
                                   url=url,
                                   host=host
                                   )
+            # temporary banned error   
             if status == 418:
                 raise BannedError("418 temporary ban", url=url, status=status, 
                                   host=host, attempt=attempts, body=body_text)
-
+            # rate limit error
             if status == 429:
                 retry = self.retry_after_seconds(hdrs)
                 sleep_s = retry if retry is not None else self.backoff_seconds(attempts)    
@@ -221,8 +232,7 @@ class HttpClient:
                             url=url, status=status, host=host, attempt=attempts, 
                             body=body_text)
 
-    # ------------- API -------------
-
+    # API
     def get(self, 
             path: str, 
             params: Optional[Dict[str, Any]], 
@@ -231,8 +241,8 @@ class HttpClient:
         
         return self._request("GET", path, params=params, headers=headers)
     
+
 if __name__ == "__main__":
-    import logging
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
     

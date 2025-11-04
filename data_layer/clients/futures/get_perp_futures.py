@@ -11,7 +11,7 @@ import numpy as np
 
 from concurrency.network.client_http import HttpClient, HttpResult
 from concurrency.orchestration.pool import WorkerPool
-from concurrency.network.spot_throttle import spot_throttle, PerpFuturesWeights
+from concurrency.network.throttle import throttle, PerpFuturesWeights
 from concurrency.orchestration.autoscaler import Autoscaler
 from concurrency.orchestration.jobs import (                            
     job_generator,
@@ -104,7 +104,7 @@ def get_klines(
         default_headers= None
     )
     
-    throttle = spot_throttle(
+    throttle = throttle(
         max_weight_minute= 5998,
         window_s= 60,
         clock= time.monotonic,

@@ -1,9 +1,6 @@
-# client/spot/orchestration/jobs.py
-from __future__ import annotations
-
 from math import ceil
-from typing import Dict, Iterator, Tuple, Any
-from datetime import datetime, timezone, timedelta
+from typing import Dict, Tuple, Any
+from datetime import datetime, timezone
 
 # ---- Intervals in MINUTES ----
 INTERVAL_MIN: Dict[str, int] = {
@@ -21,10 +18,10 @@ INTERVAL_MIN: Dict[str, int] = {
     "1d": 1440,
 }
 
-# ---- Alignment date in MINUTES ----
-def align_dates(start_min: int, end_min: int, interval: str) -> Tuple[int, int]:
+# Alignment date in minutes
+def align_dates(start_min: int, end_min: int, interval: str):
     """
-    Align [start_min, end_min) to kline open boundaries for `interval`.
+    Function aligning [start_min, end_min) to kline open boundaries for `interval`.
     Returns (aligned_start_min, aligned_end_min), end exclusive.
 
     Example
@@ -50,24 +47,24 @@ def align_dates(start_min: int, end_min: int, interval: str) -> Tuple[int, int]:
 
     return aligned_start, aligned_end
 
-# ---- UTC minutes since epoch ----
+# UTC minutes since epoch
 def parse_dates(date_str: str):
     """ 
-    Convert a timezone-aware (or naive) datetime into the total number of **minutes since the Unix epoch**.
-    The Unix epoch is defined as **January 1, 1970, 00:00:00 UTC**.  
+    Convert a timezone-aware (or naive) datetime into the total number of **minutes since the Unix epoch**.  
     
     This function returns the elapsed time between that reference point 
     and the given datetime `dt`, expressed in **whole minutes** (integer).
     """
+
     dt = datetime.fromisoformat(date_str)
 
-    if dt.tzinfo is None: # check if datetime is not defined
-        dt = dt.replace(tzinfo=timezone.utc) # set utc timezone
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
     else:
-        dt = dt.astimezone(timezone.utc) # datetime is timezone aware and is converted to UTC
-    return int(dt.timestamp() // 60) # timestamp returns the seconds from epoch to dt 
+        dt = dt.astimezone(timezone.utc)
+    return int(dt.timestamp() // 60) 
 
-# ---- Calculate total jobs ----
+# Calculate total jobs
 def total_jobs(
     start_min: int,
     end_min: int,
@@ -75,7 +72,7 @@ def total_jobs(
     per_request_limit: int = 1000,
 ):
     """
-    How many API calls (jobs) are required, based on minutes-only math.
+    How many API requests (jobs) are required, based on minutes-only math.
     """
 
     start, end = align_dates(start_min, end_min, interval)
@@ -84,9 +81,9 @@ def total_jobs(
     total_candles = max(0, (end - start) // step)
     jobs = ceil(total_candles / per_request_limit)
     
-    return jobs
+    return jobs, start, end
 
-# ---- Job generator: one yielded dict == one REST call (one job) ----
+# Job generator: one yielded dict == one REST call (one job)
 def job_generator(
     symbol: str,
     interval: str,
@@ -116,11 +113,11 @@ def job_generator(
       • No overlaps (no duplicate candles between jobs)
       • Perfect alignment to the chosen kline interval
     """
+
     step = INTERVAL_MIN[interval]
     
     start, end = align_dates(start_min, end_min, interval)
 
-    # Define the size of the chunk to retrieve
     chunk = per_request_limit * step
     
     cursor = start
@@ -129,13 +126,13 @@ def job_generator(
         yield {
             "symbol": symbol,
             "interval": interval,
-            "start_min": cursor,   # minutes, not ms
-            "end_min": next_,        # half-open → no overlap, no gaps
+            "start_min": cursor,   
+            "end_min": next_,  
             "limit": per_request_limit,
         }
         cursor = next_
 
-# ---- Request builder: convert MINUTES -> MILLISECONDS right before send ----
+# Request builder
 def build_kline_request(job: Dict[str, Any], type:str):
     """
     Turn a minute-based job into a Binance REST request in ms.
@@ -151,15 +148,13 @@ def build_kline_request(job: Dict[str, Any], type:str):
         path = "/dapi/v1/klines"
         
     return (
-        # path
         path,
-        # params
         {
             "symbol": job["symbol"],
             "interval": job["interval"],
             "startTime": start_ms,
-            "endTime": end_ms,     # half-open [start, end) by open time
-            "limit": job.get("limit", 1000), # get limit from dict or use default value 1000
+            "endTime": end_ms,
+            "limit": job.get("limit", 1000),
         },
     )
                 
@@ -169,9 +164,9 @@ if __name__ == "__main__":
     print("Testing jobs.py...")
 
     symbol = "BTCUSDT"
-    interval = "1h"               # try "1m", "5m", "1h", etc.
+    interval = "1h"               
     start_date = "2025-01-01 00:00"
-    end_date   = "2025-01-01 06:30"  # 6.5 hours -> should produce 7 jobs if per_request_limit=1
+    end_date   = "2025-01-01 06:30"
 
     # Convert to absolute minutes since epoch (UTC)
     start_min = parse_dates(start_date)
@@ -192,7 +187,7 @@ if __name__ == "__main__":
         end_min=aligned_end,
         per_request_limit=1,
     ), start=1):
-        path, params = build_kline_request(job)
+        path, params = build_kline_request(job, type="usd_future")
         print(f"Job {i}: {job['start_min']}→{job['end_min']} min | request path: {path}")
         pprint.pprint(params)
 
