@@ -49,12 +49,9 @@ class WorkerPool:
         self.weight = int(weight_per_request)
  
         self._execution = ThreadPoolExecutor(max_workers=int(max_threads), thread_name_prefix="wrkr") 
-        self._semaphore = threading.BoundedSemaphore(max(1, int(initial_concurrency))) 
 
         self._lock = threading.Lock()
-    
         self._max_threads = int(max_threads)
-
         self._market_type = market_type
     
     # Worker Execution Loop
@@ -64,8 +61,6 @@ class WorkerPool:
         retries = 0
         while True:
             try:    
-
-                self._semaphore.acquire()
                 self.throttle.acquire(self.weight)
                 path, params = self.request_builder(job, self._market_type)
 
@@ -74,7 +69,6 @@ class WorkerPool:
                 except Exception as e:
                     break
                 self.response(result, job)
-
                 break 
             
             except Exception as e:
@@ -83,8 +77,6 @@ class WorkerPool:
                 if retries >= max_retries:
                     print(f"[_run_job DEBUG] Job {job} exceeded max retries, skipping")
                     break
-            finally:
-                self._semaphore.release()
 
     def submit_all(self, jobs: List[Dict[str, Any]]):
         """Submit all jobs at once and wait for completion."""

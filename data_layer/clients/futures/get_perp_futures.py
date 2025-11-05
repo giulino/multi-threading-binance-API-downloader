@@ -101,7 +101,8 @@ def get_klines(
         max_retries= 5,
         backoff_base_s= 0.25,
         backoff_factor= 2,
-        default_headers= None
+        default_headers= None,
+        pool_maxsize = 64
     )
     
     throttle = throttle(

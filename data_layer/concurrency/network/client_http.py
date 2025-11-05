@@ -2,6 +2,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from collections import deque
 import requests
+from requests.adapters import HTTPAdapter
 import random
 import time
 import logging
@@ -63,6 +64,7 @@ class HttpClient:
             backoff_base_s: float = 0.25,
             backoff_factor: int = 2,
             default_headers: Optional[Dict[str, str]] = None,
+            pool_maxsize: int = 64,
     ):
         hosts = list(hosts)
         if not hosts:
@@ -70,6 +72,9 @@ class HttpClient:
         
         self.hosts = deque(hosts)
         self.session = requests.Session() 
+        adapter = HTTPAdapter(pool_connections=pool_maxsize, pool_maxsize=pool_maxsize)
+        self.session.mount("http://", adapter)
+        self.session.mount("https://", adapter)
         self.timeout = (connection_timeouts_s, read_timeouts_s)
         self.max_retries = max_retries
         self.backoff_base_s = backoff_base_s
@@ -77,7 +82,6 @@ class HttpClient:
         self.default_headers = default_headers or {}
 
     # Inner Functions
- 
     @staticmethod
     def full_url(host: str, path: str):
         """Static Method to avoid bugs on missing slashes"""

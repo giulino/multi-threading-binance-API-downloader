@@ -103,7 +103,8 @@ def get_klines(
         max_retries= 5,
         backoff_base_s= 0.25,
         backoff_factor= 2,
-        default_headers= None
+        default_headers= None,
+        pool_maxsize = 80
     )
     
     throttle = Throttle_(
@@ -131,6 +132,7 @@ def get_klines(
     # Result collection 
     results: List[Dict[str, Any]] = []
     results_lock = threading.Lock()
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
     def process_result(res: HttpResult, job: Dict[str, Any]):
         rows = res.data if isinstance(res.data, list) else []
@@ -138,11 +140,10 @@ def get_klines(
         if parsed:
             with results_lock:
                 results.extend(parsed)
-            logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
             logging.info(f"Processed {len(parsed)} rows for job {job['symbol']}\
                          from {job['start_min']} to {job['end_min']}")
 
-    warmup_jobs = 25
+    warmup_jobs = 5
     warmup_batch, remaining = jobs[:warmup_jobs], jobs[warmup_jobs:] 
     
     def run_warmup(batch):
@@ -158,7 +159,7 @@ def get_klines(
             rtt = 0.25
         return np.mean(rtt) 
     
-    max_threads = 20
+    max_threads = 80
     rtt_s = run_warmup(warmup_batch)
     target_workers = min(autoscaler.workers(rtt_s), max_threads)
 
@@ -170,13 +171,15 @@ def get_klines(
         response= process_result,
         weight_per_request= SpotWeights.KLINES,
         max_threads= max_threads,
-        initial_concurrency= target_workers,
+        initial_concurrency= 80,
         market_type="spot"
     )
     
     # Submit all jobs at once
     pool.submit_all(remaining)
     pool.shutdown()
+
+    average_usage = throttle.mean_usage()
 
     # Build Polars DataFrame
     if not results:
@@ -229,7 +232,7 @@ def get_klines(
     return df, out_parquet_path,\
         warmup_jobs,\
         rtt_s, target_workers,\
-        total_Jobs
+        total_Jobs, average_usage
 
 # Example: BTCUSDT 1m, one year
 if __name__ == "__main__":
@@ -240,7 +243,7 @@ if __name__ == "__main__":
 
     SYMBOL = ["BTCUSDT"] # add all the binance symbols to download 
     INTERVAL = "1m"
-    START = "2024-01-01 00:00"
+    START = "2025-01-01 00:00"
     END   = "2025-01-01 00:00"
 
     
@@ -252,7 +255,7 @@ if __name__ == "__main__":
 
         df, parquet_path,\
         warmup_jobs, rtt_s,\
-        target_workers, total_Jobs = get_klines(ticker, INTERVAL, START, END, path, per_request_limit= REQUEST_LIMIT)
+        target_workers, total_Jobs, average_usage = get_klines(ticker, INTERVAL, START, END, path, per_request_limit= REQUEST_LIMIT)
         
         # Stats
         total_klines = len(df)
@@ -269,6 +272,7 @@ if __name__ == "__main__":
         print(f"Total klines processed: {total_klines}")
         print(f"Total requests processed: {total_Jobs}")
         print(f"Throughput: {int(throughput)} klines/sec")
+        print(f"Average weight usage: {average_usage}%")
         print(" ")
         print(f"Parquet file located at: {parquet_path}")
         print(df.tail(5))
@@ -276,5 +280,5 @@ if __name__ == "__main__":
     end = datetime.now()
     delta = end - start
     print(" ")
-    print(df.columns)
+    # print(df.columns)
     print(f"All data were correctly retrieved in {delta}!")

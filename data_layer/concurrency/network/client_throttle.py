@@ -1,5 +1,6 @@
 import time
 import threading
+import logging
 
 from collections import deque
 from typing import Deque, Tuple
@@ -21,7 +22,7 @@ class Throttle_:
 
     def __init__(
             self,
-            max_weight_minute: int = 5990,
+            max_weight_minute: int = 6000,
             window_s: int = 60,
             clock = time.monotonic,
             min_sleep: float = 2.0
@@ -34,8 +35,11 @@ class Throttle_:
         
         self.hits: Deque[Tuple[float, int]] = deque()
         self.used = 0
-        self.lock = threading.Lock()
+        self.capacity_used = 0
+        self.capacity_sample = 0
 
+        self.lock = threading.Lock()
+        
     def acquire(self, weight: int = SpotWeights.KLINES):
 
         """Method that reserves weights or sleeps until capacity is available"""
@@ -49,11 +53,22 @@ class Throttle_:
                 if self.used + weight <= self.max_weight_minute:
                     self.hits.append((now, weight))
                     self.used += weight
-                    return
+                    usage_ratio = self.used /self.max_weight_minute
+                    self.capacity_used += usage_ratio
+                    self.capacity_sample += 1
+                    # logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+                    # logging.info("Throttle usage: %.1f%% (%d/%d)", usage_ratio, self.used, self.max_weight_minute)
+                    return 
                 
                 # Sleep when capacity not available
                 sleep_s = self.sleep_until_capacity_unlocked(now)   
             time.sleep(sleep_s + 0.2)
+    
+    def mean_usage(self):
+        
+        average_usage = self.capacity_used / self.capacity_sample
+
+        return average_usage   
 
     def pop_old_locked(self, now: float):
         
