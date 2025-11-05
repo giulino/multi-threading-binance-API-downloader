@@ -1,4 +1,4 @@
-# Binance Concurrent Market Data Downloader
+# Binance Concurrent Market Data Downloader (Work in progress)
 
 A high-performance Python framework for downloading and validating historical OHLC market data from the Binance REST API — featuring multi-threaded concurrency, rate-limit control, and blazing-fast data processing with Polars.
 
