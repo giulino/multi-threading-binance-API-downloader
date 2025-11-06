@@ -1,18 +1,15 @@
-import time
+import asyncio
 from datetime import datetime
 from typing import Any, Dict, List, Optional
-import warnings
 
 import polars as pl
 from pathlib import Path
 import logging
-import threading
 import numpy as np
 
 from concurrency.network.client_http import HttpClient, HttpResult
 from concurrency.orchestration.pool import WorkerPool
 from concurrency.network.client_throttle import Throttle_, SpotWeights
-from concurrency.orchestration.autoscaler import Autoscaler
 from concurrency.orchestration.jobs import (                            
     job_generator,
     build_kline_request,
@@ -69,7 +66,7 @@ def parse(df):
     return df 
 
 # Public function
-def get_klines(
+async def get_klines(
     symbol: str,
     interval: Optional[str],
     start_date: str,     # e.g. "2025-01-01 00:00"
@@ -84,100 +81,75 @@ def get_klines(
     Returns (df, parquet_path) where parquet_path is the written path (or
     a default suggestion if not provided).
     """
-    
+    print(f"\nFetching data for {symbol}...")
+
     start_min = parse_dates(start_date)
     end_min   = parse_dates(end_date)
 
-    # Create transport + throttle
-    http = HttpClient(
-        hosts=(
-            "https://api4.binance.com",
-            "https://api3.binance.com",
-            "https://api2.binance.com",
-            "https://api1.binance.com",
-            "https://api-gcp.binance.com",
-            "https://api.binance.com",
-        ),
-        connection_timeouts_s= 3.0,
-        read_timeouts_s= 2.0,
-        max_retries= 5,
-        backoff_base_s= 0.25,
-        backoff_factor= 2,
-        default_headers= None,
-        pool_maxsize = 80
+    hosts = (
+        "https://api4.binance.com",
+        "https://api3.binance.com",
+        "https://api2.binance.com",
+        "https://api1.binance.com",
+        "https://api-gcp.binance.com",
+        "https://api.binance.com",
     )
-    
+
     throttle = Throttle_(
-        max_weight_minute= 5998,
-        window_s= 60,
-        clock= time.monotonic,
-        min_sleep= 2.0
+        max_weight_minute=5998,
+        window_s=60,
+        clock=asyncio.get_running_loop().time,
+        min_sleep=0.01,
     )
 
-    # Calculate total jobs
-    total_Jobs, aligned_start, aligned_end = total_jobs(start_min, end_min, interval, per_request_limit)
-    
-    # Generate jobs
-    jobs = list(job_generator(
-        symbol= symbol,
-        interval= interval,
-        start_min= aligned_start,
-        end_min= aligned_end,
-        per_request_limit= per_request_limit,
-    ))
+    async with HttpClient(
+        hosts=hosts,
+        connection_timeouts_s=3.0,
+        read_timeouts_s=2.0,
+        max_retries=5,
+        backoff_base_s=0.25,
+        backoff_factor=2,
+        default_headers=None,
+        pool_maxsize=128,
+    ) as http:
 
-    # Define autoscaler function
-    autoscaler = Autoscaler(throttle= throttle, min_workers= 1, max_workers= 50)
+        total_Jobs, aligned_start, aligned_end = total_jobs(start_min, end_min, interval, per_request_limit)
+        
+        jobs = list(job_generator(
+            symbol=symbol,
+            interval=interval,
+            start_min=aligned_start,
+            end_min=aligned_end,
+            per_request_limit=per_request_limit,
+        ))
 
-    # Result collection 
-    results: List[Dict[str, Any]] = []
-    results_lock = threading.Lock()
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+        results: List[Dict[str, Any]] = []
+        results_lock = asyncio.Lock()
 
-    def process_result(res: HttpResult, job: Dict[str, Any]):
-        rows = res.data if isinstance(res.data, list) else []
-        parsed = _rows_to_dicts(job["symbol"], job["interval"], rows)
-        if parsed:
-            with results_lock:
+        async def process_result(res: HttpResult, job: Dict[str, Any]):
+            rows = res.data if isinstance(res.data, list) else []
+            parsed = _rows_to_dicts(job["symbol"], job["interval"], rows)
+            if not parsed:
+                return
+            async with results_lock:
                 results.extend(parsed)
-            logging.info(f"Processed {len(parsed)} rows for job {job['symbol']}\
-                         from {job['start_min']} to {job['end_min']}")
 
-    warmup_jobs = 5
-    warmup_batch, remaining = jobs[:warmup_jobs], jobs[warmup_jobs:] 
-    
-    def run_warmup(batch):
-        rtt = []
-        for job in batch:
-            throttle.acquire(SpotWeights.KLINES)
-            path, params = build_kline_request(job, "spot")
-            res = http.get(path, params=params)
-            rtt.append(res.elapsed_ms)
-            process_result(res, job)
-        if len(rtt) == 0:
-            warnings.warn("The warm up rtt list is empty - setting a default rtt of 0.25s")
-            rtt = 0.25
-        return np.mean(rtt) 
-    
-    max_threads = 80
-    rtt_s = run_warmup(warmup_batch)
-    target_workers = min(autoscaler.workers(rtt_s), max_threads)
+        max_concurrency = 50
+        weight_capacity = max(1, throttle.max_weight_minute // SpotWeights.KLINES)
+        target_workers = min(max_concurrency, weight_capacity, len(jobs) or 1)
 
-    # Build WorkerPool
-    pool = WorkerPool(
-        http= http,
-        throttle= throttle,
-        request_builder= build_kline_request,
-        response= process_result,
-        weight_per_request= SpotWeights.KLINES,
-        max_threads= max_threads,
-        initial_concurrency= 80,
-        market_type="spot"
-    )
-    
-    # Submit all jobs at once
-    pool.submit_all(remaining)
-    pool.shutdown()
+        pool = WorkerPool(
+            http=http,
+            throttle=throttle,
+            request_builder=build_kline_request,
+            response=process_result,
+            weight_per_request=SpotWeights.KLINES,
+            max_concurrency=max_concurrency,
+            market_type="spot",
+        )
+
+        await pool.run(jobs, concurrency=target_workers)
+        await pool.shutdown()
 
     average_usage = throttle.mean_usage()
 
@@ -230,55 +202,47 @@ def get_klines(
     df.write_parquet(out_parquet_path)  
     
     return df, out_parquet_path,\
-        warmup_jobs,\
-        rtt_s, target_workers,\
+        target_workers,\
         total_Jobs, average_usage
 
-# Example: BTCUSDT 1m, one year
-if __name__ == "__main__":
-
-    start = datetime.now()
+async def main():
 
     REQUEST_LIMIT = 1000
 
-    SYMBOL = ["BTCUSDT"] # add all the binance symbols to download 
+    SYMBOL = ["BTCUSDT", "ETHUSDT", "BNBUSDT"]
     INTERVAL = "1m"
-    START = "2025-01-01 00:00"
+    START = "2019-01-01 00:00"
     END   = "2025-01-01 00:00"
 
-    
     for ticker in SYMBOL:
-        
         start_time = datetime.now()
 
-        path = f"/home/homercrypton/hedge-room/data/binance/spot/ohlc/{INTERVAL}/{ticker}" # /Users/giuliomannini/Hedge-Room/data/binance/spot/ohlc/
+        path = f"/home/homercrypton/hedge-room/data/binance/spot/ohlc/{INTERVAL}/{ticker}"
 
-        df, parquet_path,\
-        warmup_jobs, rtt_s,\
-        target_workers, total_Jobs, average_usage = get_klines(ticker, INTERVAL, START, END, path, per_request_limit= REQUEST_LIMIT)
+        (
+            df,
+            parquet_path,
+            target_workers,
+            total_Jobs,
+            average_usage,
+        ) = await get_klines(ticker, INTERVAL, START, END, path, per_request_limit=REQUEST_LIMIT)
         
-        # Stats
         total_klines = len(df)
         end_time = datetime.now()
         delta = end_time - start_time
         throughput = total_klines / delta.total_seconds() if delta.total_seconds() > 0 else 0.0
-        
+        print(" ")
         print(f"\nAll requests completed for {ticker}!")
         print(" ")
-        if total_Jobs > warmup_jobs:
-            print(f"Average round time trip over {warmup_jobs} jobs is {rtt_s:.2f} seconds")
-            print(f"Number of target workers based on the average RTT is {target_workers}")
         print(f"Total time: {delta}")
         print(f"Total klines processed: {total_klines}")
         print(f"Total requests processed: {total_Jobs}")
         print(f"Throughput: {int(throughput)} klines/sec")
-        print(f"Average weight usage: {average_usage}%")
+        print(f"Target concurrency: {target_workers}")
+        print(f"Average weight usage: {average_usage * 100:.2f}%")
         print(" ")
         print(f"Parquet file located at: {parquet_path}")
         print(df.tail(5))
-    
-    end = datetime.now()
-    delta = end - start
-    print(" ")
-    # print(df.columns)
-    print(f"All data were correctly retrieved in {delta}!")
+
+if __name__ == "__main__":
+    asyncio.run(main())

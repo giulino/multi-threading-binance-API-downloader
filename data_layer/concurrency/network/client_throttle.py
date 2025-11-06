@@ -1,7 +1,5 @@
+import asyncio
 import time
-import threading
-import logging
-
 from collections import deque
 from typing import Deque, Tuple
 
@@ -37,15 +35,14 @@ class Throttle_:
         self.used = 0
         self.capacity_used = 0
         self.capacity_sample = 0
+        self._lock = asyncio.Lock()
 
-        self.lock = threading.Lock()
-        
-    def acquire(self, weight: int = SpotWeights.KLINES):
+    async def acquire(self, weight: int = SpotWeights.KLINES):
 
         """Method that reserves weights or sleeps until capacity is available"""
 
         while True:
-            with self.lock:
+            async with self._lock:
                 now = self.clock()
                 self.pop_old_locked(now)
             
@@ -53,19 +50,19 @@ class Throttle_:
                 if self.used + weight <= self.max_weight_minute:
                     self.hits.append((now, weight))
                     self.used += weight
-                    usage_ratio = self.used /self.max_weight_minute
+                    usage_ratio = self.used / self.max_weight_minute
                     self.capacity_used += usage_ratio
                     self.capacity_sample += 1
-                    # logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-                    # logging.info("Throttle usage: %.1f%% (%d/%d)", usage_ratio, self.used, self.max_weight_minute)
                     return 
                 
                 # Sleep when capacity not available
                 sleep_s = self.sleep_until_capacity_unlocked(now)   
-            time.sleep(sleep_s + 0.2)
+            await asyncio.sleep(sleep_s + 0.2)
     
     def mean_usage(self):
         
+        if self.capacity_sample == 0:
+            return 0.0
         average_usage = self.capacity_used / self.capacity_sample
 
         return average_usage   
@@ -97,32 +94,27 @@ class Throttle_:
         oldest_ts, _ = self.hits[0]
         expires_in = (oldest_ts + self.window_s) - now 
         
-        return expires_in
+        return max(expires_in, 0.0)
 
     
 if __name__ == "__main__":
 
-    print("Testing throttle...")
+    async def _demo():
+        print("Testing async throttle...")
 
-    throttle = Throttle_(max_weight_minute=5, window_s=3)
+        throttle = Throttle_(max_weight_minute=5, window_s=3)
 
-    def worker(id: int, weight: int):
-        print(f"[Worker {id}] Trying to acquire weight {weight} at {time.time():.2f}")
-        throttle.acquire(weight)
-        print(f"[Worker {id}] Acquired weight {weight} at {time.time():.2f}")
-        time.sleep(1)
-        print(f"[Worker {id}] Done at {time.time():.2f}")
+        async def worker(worker_id: int, weight: int):
+            print(f"[Worker {worker_id}] Waiting to acquire weight {weight} at {time.time():.2f}")
+            await throttle.acquire(weight)
+            print(f"[Worker {worker_id}] Acquired weight {weight} at {time.time():.2f}")
+            await asyncio.sleep(1.0)
+            print(f"[Worker {worker_id}] Finished at {time.time():.2f}")
 
-    # Start multiple threads
-    threads = []
-    weights = [2, 2, 2]
-    for i, w in enumerate(weights):
-        t = threading.Thread(target=worker, args=(i+1, w))
-        t.start()
-        threads.append(t)
-        time.sleep(0.1)
+        await asyncio.gather(
+            *(worker(idx + 1, weight) for idx, weight in enumerate([2, 2, 2]))
+        )
 
-    for t in threads:
-        t.join()
+        print("Throttle test completed.")
 
-    print("Throttle test completed.")
+    asyncio.run(_demo())

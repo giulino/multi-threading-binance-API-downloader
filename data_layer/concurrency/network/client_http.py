@@ -1,8 +1,8 @@
-from __future__ import annotations
+
 from dataclasses import dataclass
 from collections import deque
-import requests
-from requests.adapters import HTTPAdapter
+import aiohttp
+import asyncio
 import random
 import time
 import logging
@@ -71,15 +71,43 @@ class HttpClient:
             raise ValueError("HttpClient requires at least one base host")
         
         self.hosts = deque(hosts)
-        self.session = requests.Session() 
-        adapter = HTTPAdapter(pool_connections=pool_maxsize, pool_maxsize=pool_maxsize)
-        self.session.mount("http://", adapter)
-        self.session.mount("https://", adapter)
-        self.timeout = (connection_timeouts_s, read_timeouts_s)
+        self.timeout = aiohttp.ClientTimeout(
+            total=None,
+            sock_connect=connection_timeouts_s,
+            sock_read=read_timeouts_s,
+        )
         self.max_retries = max_retries
         self.backoff_base_s = backoff_base_s
         self.backoff_factor = backoff_factor
         self.default_headers = default_headers or {}
+        self.pool_maxsize = pool_maxsize
+        self.session: Optional[aiohttp.ClientSession] = None
+        self._connector: Optional[aiohttp.TCPConnector] = None
+
+    async def __aenter__(self):
+        await self._ensure_session()
+        return self
+    
+    async def __aexit__(self, exc_type, exc, tb):
+        if self.session and not self.session.closed:
+            await self.session.close()
+        if self._connector and not self._connector.closed:
+            await self._connector.close()
+
+    async def _ensure_session(self):
+        """Create the aiohttp session if it is not already available."""
+        if self.session and not self.session.closed:
+            return
+        if self._connector and not self._connector.closed:
+            await self._connector.close()
+        self._connector = aiohttp.TCPConnector(
+            limit=self.pool_maxsize,
+            limit_per_host=self.pool_maxsize,
+        )
+        self.session = aiohttp.ClientSession(
+            connector=self._connector,
+            timeout=self.timeout,
+        )
 
     # Inner Functions
     @staticmethod
@@ -93,21 +121,6 @@ class HttpClient:
         return f"{host}{path}"
     
     @staticmethod
-    def parse_payload(response: requests.Response):
-        """
-        Helper Method deciding how to interpret the server’s response body, 
-        depending on its Content-Type header
-        """
-        
-        type = response.headers.get("Content-Type", "")
-        if "application/json" in type:
-            try:
-                return response.json() # parsing JSON in python object
-            except ValueError:
-                return response.text # returns the raw text as it is
-        return response.text
-    
-    @staticmethod
     def retry_after_seconds(headers: Dict[str, str]):
         """Static Method that reads the header response"""
 
@@ -117,7 +130,7 @@ class HttpClient:
         try:
             return float(ra)
         except ValueError:
-            return print("The client couldn't access the response header")
+            return None
 
     def rotate_host(self):
         """
@@ -137,12 +150,7 @@ class HttpClient:
         base = self.backoff_base_s * (self.backoff_factor ** (attempt - 1))
         jitter = random.uniform(0.0, 0.1) # de-synchronized retries across clients
         total = base + jitter
-        print(f"Sleep for: {total} seconds")
-        
         return min(total, 8.0)
-
-    def sleep_backoff(self, attempt: int):
-        time.sleep(self.backoff_seconds(attempt))
 
     def _merge_headers(self, headers: Optional[Dict[str, str]]):
         merged = dict(self.default_headers)
@@ -151,126 +159,177 @@ class HttpClient:
         return merged
 
     # Build request
-    def _request(self, 
-                method: str, 
-                path: str, 
-                params: Optional[Dict[str, Any]], 
-                headers: Optional[Dict[str, str]]):    
-        """
-        Method that builds the http request and handle responses.
-        """
-                 
+    async def _request(
+        self,
+        method: str,
+        path: str,
+        params: Optional[Dict[str, Any]],
+        headers: Optional[Dict[str, str]],
+    ) -> HttpResult:
+        """Build and execute an HTTP request with retries/backoff."""
+
+        await self._ensure_session()
+
         attempts = 0
         merged_headers = self._merge_headers(headers)
-        qparams = {k: v for k, v in (params or {}).items() if v is not None} 
+        qparams = {k: v for k, v in (params or {}).items() if v is not None}
 
-        while True:
-            
-            attempts +=1
+        last_status: Optional[int] = None
+        last_body: str = ""
+        last_host: Optional[str] = None
+        last_url: Optional[str] = None
+
+        while attempts < self.max_retries:
+            attempts += 1
             host = self.hosts[0]
             url = self.full_url(host, path)
+            last_host = host
+            last_url = url
 
-            start_time = time.perf_counter()
             try:
-                response = self.session.request(
-                    method, url, params=qparams, headers=merged_headers, timeout=self.timeout
-                )
-                end_time = time.perf_counter()
-                rtt = (end_time - start_time)
+                start_time = time.perf_counter()
+                async with self.session.request(
+                    method,
+                    url,
+                    params=qparams,
+                    headers=merged_headers,
+                    timeout=self.timeout,
+                ) as response:
+                    end_time = time.perf_counter()
+                    rtt = end_time - start_time
 
-            except (requests.ConnectionError, requests.Timeout) as e: 
+                    status = response.status
+                    last_status = status
+
+                    hdrs = {k.lower(): v for k, v in response.headers.items()}
+                    body_text = await response.text()
+                    last_body = body_text
+
+                    content_type = hdrs.get("content-type", "")
+                    if "application/json" in content_type:
+                        try:
+                            data = await response.json(content_type=None)
+                        except Exception:
+                            data = body_text
+                    else:
+                        data = body_text
+
+                    if 200 <= status < 300:
+                        return HttpResult(
+                            status=status,
+                            headers=hdrs,
+                            data=data,
+                            elapsed_ms=rtt * 1000.0,
+                            url=url,
+                            host=host,
+                        )
+
+                    if status == 418:
+                        raise BannedError(
+                            "418 temporary ban",
+                            url=url,
+                            status=status,
+                            host=host,
+                            attempt=attempts,
+                            body=body_text,
+                        )
+
+                    if status == 429:
+                        retry = self.retry_after_seconds(hdrs)
+                        sleep_s = retry if retry is not None else self.backoff_seconds(attempts)
+                        if attempts >= self.max_retries:
+                            raise RateLimitError(
+                                "429 rate limit (retries exhausted)",
+                                url=url,
+                                status=status,
+                                host=host,
+                                attempt=attempts,
+                                body=body_text,
+                            )
+                        await asyncio.sleep(sleep_s)
+                        continue
+
+                    if 500 <= status < 600:
+                        self.rotate_host()
+                        await asyncio.sleep(self.backoff_seconds(attempts))
+                        continue
+
+                    raise HttpError(
+                        f"Sender malformed requests: {status}: {body_text[:120]}",
+                        url=url,
+                        status=status,
+                        host=host,
+                        attempt=attempts,
+                        body=body_text,
+                    )
+
+            except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
                 self.rotate_host()
-                if attempts > self.max_retries:
-                    raise HttpError(f"Network error after {attempts} attempts: {e}",
-                                    url=url, status=None, host=host, attempt=attempts)
-                self.sleep_backoff(attempts)
-            
-            status = response.status_code
-            if not status:
-                self.rotate_host()
-                if attempts > self.max_retries:
-                    raise HttpError(f"Network error after {attempts} attempts: {e}",
-                                    url=url, status=None, host=host, attempt=attempts)
-                self.sleep_backoff(attempts)
-
-            hdrs = {k.lower(): v for k, v in response.headers.items()}
-            body_text = response.text or ""
-
-            if 200 <= status < 300:
-                data = self.parse_payload(response)
-                return HttpResult(status=status, 
-                                  headers=hdrs, 
-                                  data=data, 
-                                  elapsed_ms=rtt, 
-                                  url=url,
-                                  host=host
-                                  )
-            # temporary banned error   
-            if status == 418:
-                raise BannedError("418 temporary ban", url=url, status=status, 
-                                  host=host, attempt=attempts, body=body_text)
-            # rate limit error
-            if status == 429:
-                retry = self.retry_after_seconds(hdrs)
-                sleep_s = retry if retry is not None else self.backoff_seconds(attempts)    
-                if attempts > self.max_retries:
-                    raise RateLimitError("429 rate limit (retries exhausted)",
-                                         url=url, status=status, 
-                                         host=host, attempt=attempts, body=body_text)
-                time.sleep(sleep_s)
+                await asyncio.sleep(self.backoff_seconds(attempts))
+                if attempts >= self.max_retries:
+                    raise HttpError(
+                        f"Network error after {attempts} attempts: {exc}",
+                        url=last_url or "",
+                        status=None,
+                        host=last_host or "",
+                        attempt=attempts,
+                        body=str(exc),
+                    ) from exc
                 continue
-            
-            # 5xx server side errors: rotate host
-            if 500 <= status < 600:
-                self.rotate_host()
-                logging.info("Rotating host")
-                if attempts > self.max_retries:
-                    raise HttpError(f"Server error {status} (retries exhausted)",
-                                    url=url, status=status, host=host, 
-                                    attempt=attempts, body=body_text)
-                self.sleep_backoff(attempts)
-                continue
-            
-            # 4xx/odd codes: raise immediately
-            raise HttpError(f"Sender malformed requests: {status}: {body_text[:120]}", 
-                            url=url, status=status, host=host, attempt=attempts, 
-                            body=body_text)
+
+        if last_status == 429:
+            raise RateLimitError(
+                f"429 rate limit (retries exhausted)",
+                url=last_url or "",
+                status=last_status,
+                host=last_host or "",
+                attempt=attempts,
+                body=last_body,
+            )
+
+        raise HttpError(
+            f"Max retries reached ({self.max_retries})",
+            url=last_url or "",
+            status=last_status,
+            host=last_host or "",
+            attempt=attempts,
+            body=last_body,
+        )
 
     # API
-    def get(self, 
+    async def get(self, 
             path: str, 
             params: Optional[Dict[str, Any]], 
             headers: Optional[Dict[str, str]]=None):
         """Public, user-facing method for performing HTTP GET requests"""
         
-        return self._request("GET", path, params=params, headers=headers)
+        return await self._request("GET", path, params=params, headers=headers)
     
 
-if __name__ == "__main__":
-
+async def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-    
-    # List of Binance endpoints
+
     hosts = [
         "https://api.binance.com",
         "https://api1.binance.com",
         "https://api2.binance.com",
     ]
 
-    client = HttpClient(hosts=hosts, max_retries=3, connection_timeouts_s=3, read_timeouts_s=2)
+    async with HttpClient(hosts=hosts, max_retries=3, connection_timeouts_s=3, read_timeouts_s=2) as client:
+        path = "/api/v3/klines"
+        params = {"symbol": "BTCUSDT", "interval": "1m", "limit": 5}
 
-    # Example request: BTCUSDT 1m klines, limit 5
-    path = "/api/v3/klines"
-    params = {"symbol": "BTCUSDT", "interval": "1m", "limit": 5}
+        try:
+            result = await client.get(path, params=params)
+            logging.info(f"HTTP GET success! Status: {result.status}, elapsed: {result.elapsed_ms:.2f}ms")
+            logging.info(f"Data returned (first item): {result.data[0] if result.data else 'No data'}")
+        except RateLimitError as e:
+            logging.warning(f"Rate-limited: {e}")
+        except HttpError as e:
+            logging.error(f"HTTP error: {e}")
+        except Exception as e:
+            logging.error(f"Unexpected error: {e}")
 
-    try:
-        result = client.get(path, params=params, headers=None)
-        logging.info(f"HTTP GET success! Status: {result.status}, elapsed: {result.elapsed_ms:.2f}ms")
-        logging.info(f"Data returned (first item): {result.data[0] if result.data else 'No data'}")
-    except RateLimitError as e:
-        logging.warning(f"Rate-limited: {e}")
-    except HttpError as e:
-        logging.error(f"HTTP error: {e}")
-    except Exception as e:
-        logging.error(f"Unexpected error: {e}")
+if __name__ == "__main__":
+    asyncio.run(main())
     

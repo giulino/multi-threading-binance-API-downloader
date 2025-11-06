@@ -1,186 +1,139 @@
-import time
+import asyncio
 from datetime import datetime
 from typing import Any, Dict, List, Optional
-import warnings
 
 import polars as pl
 from pathlib import Path
-import logging
-import threading
-import numpy as np
 
 from concurrency.network.client_http import HttpClient, HttpResult
 from concurrency.orchestration.pool import WorkerPool
-from concurrency.network.throttle import throttle, PerpFuturesWeights
-from concurrency.orchestration.autoscaler import Autoscaler
-from concurrency.orchestration.jobs import (                            
+from concurrency.network.client_throttle import Throttle_, PerpFuturesWeights
+from concurrency.orchestration.jobs import (
     job_generator,
     build_kline_request,
     parse_dates,
-    total_jobs
+    total_jobs,
 )
 
-# Parse Binance kline rows into dicts 
-def _rows_to_dicts(symbol: str, interval: str, rows: List[List[Any]]):
-    out: List[Dict[str, Any]] = []
-    for r in rows:
-        if not isinstance(r, (list, tuple)) or len(r) < 11:
-            continue
-        open_time_ms = int(r[0])
-        close_time_ms = int(r[6])
-        out.append(
-            {
-                "symbol": symbol,
-                "interval": interval,
-                "open_time": open_time_ms,   # seconds (optional, handy)
-                "open": float(r[1]),
-                "high": float(r[2]),
-                "low": float(r[3]),
-                "close": float(r[4]),
-                "volume": float(r[5]),
-                "close_time": close_time_ms, # seconds (optional)
-                "quote_volume": float(r[7]),
-                "num_trades": int(r[8]),
-                "taker_buy_base": float(r[9]),
-                "taker_buy_quote": float(r[10]),
-            }
-        )
-    return out
 
-def parse(df):
-    """
-    Convert `open_time` and `close_time` columns (seconds since epoch) 
-    to ISO 8601 format strings.
-    """
-    # Converte columns from milliseconds to ISO 8601
-    for col in ["open_time", "close_time"]:
-        df = df.with_columns(
-            pl.col(col)
-            .cast(pl.Datetime(time_unit="ms"))      
-            .dt.strftime("%Y-%m-%dT%H:%M")     # ISO 8601 with literal Z
-            .alias(col)
-        )
-    # Separate date and time in two columns    
-    df = df.with_columns(pl.col("open_time").dt.strftime("%Y-%m-%d").alias('Date'))
-    df = df.with_columns(pl.col("open_time").dt.strftime("%H:%M").alias('open_time_only'))
-    df = df.with_columns(pl.col("close_time").dt.strftime("%H:%M").alias('close_time_only'))
-    
-    # Drop old columns
-    df = df.drop(["open_time", "close_time"])
+def parse(df: pl.DataFrame) -> pl.DataFrame:
+    """Format timestamp columns and add readable fields."""
+    df = df.with_columns(
+        [
+            pl.col("open_time").cast(pl.Datetime(time_unit="ms")),
+            pl.col("close_time").cast(pl.Datetime(time_unit="ms")),
+        ]
+    )
+    df = df.with_columns(
+        [
+            pl.col("open_time").dt.strftime("%Y-%m-%d").alias("Date"),
+            pl.col("open_time").dt.strftime("%H:%M").alias("open_time_only"),
+            pl.col("close_time").dt.strftime("%H:%M").alias("close_time_only"),
+        ]
+    )
+    return df.drop(["open_time", "close_time"])
 
-    return df 
 
-# Public function
-def get_klines(
+async def get_klines(
     symbol: str,
     interval: str,
-    start_date: str,     # e.g. "2025-01-01 00:00"
-    end_date: str,       # e.g. "2025-01-02 00:00"
+    start_date: str,
+    end_date: str,
     path: Optional[str] = None,
     per_request_limit: int = 500,
-):
+) -> Any:
     """
-    Download Spot klines via REST, aggregate into a Polars DataFrame,
-    and write a Parquet file if `path` is provided.
-
-    Returns (df, parquet_path) where parquet_path is the written path (or
-    a default suggestion if not provided).
+    Download USD-margined perpetual futures klines and persist to Parquet.
+    Returns (df, parquet_path, target_workers, total_jobs, avg_usage).
     """
-    
-    # Convert dates in absolute minutes (UTC)
-    start_min = parse_dates(start_date)  # minutes since epoch
-    end_min   = parse_dates(end_date)
 
-    # Create transport + throttle
-    http = HttpClient(
-        hosts=(
-            "https://fapi.binance.com",
-        ),
-        connection_timeouts_s= 3.0,
-        read_timeouts_s= 2.0,
-        max_retries= 5,
-        backoff_base_s= 0.25,
-        backoff_factor= 2,
-        default_headers= None,
-        pool_maxsize = 64
+    start_min = parse_dates(start_date)
+    end_min = parse_dates(end_date)
+
+    hosts = (
+        "https://fapi.binance.com",
+        "https://fapi1.binance.com",
+        "https://fapi2.binance.com",
+        "https://fapi3.binance.com",
     )
-    
-    throttle = throttle(
-        max_weight_minute= 5998,
-        window_s= 60,
-        clock= time.monotonic,
-        min_sleep= 2.0
+
+    throttle = Throttle_(
+        max_weight_minute=5998,
+        window_s=60,
+        clock=asyncio.get_running_loop().time,
+        min_sleep=0.01,
     )
-    
-    # Generate jobs
-    jobs = list(job_generator(
-        symbol= symbol,
-        interval= interval,
-        start_min= start_min,
-        end_min= end_min,
-        per_request_limit= per_request_limit,
-    ))
 
-    # Define the autoscaler function
-    autoscaler = Autoscaler(throttle= throttle, min_workers= 1, max_workers= 50)
-    def scale_func(rtt_s: float):
-        return autoscaler.workers(rtt_s)
+    raw_rows: List[List[Any]] = []
+    target_workers = 0
 
-    # Result collection (thread-safe)
-    results: List[Dict[str, Any]] = []
-    results_lock = threading.Lock()
+    async with HttpClient(
+        hosts=hosts,
+        connection_timeouts_s=3.0,
+        read_timeouts_s=2.0,
+        max_retries=5,
+        backoff_base_s=0.25,
+        backoff_factor=2,
+        default_headers=None,
+        pool_maxsize=128,
+    ) as http:
 
-    def process_result(res: HttpResult, job: Dict[str, Any]):
-        rows = res.data if isinstance(res.data, list) else []
-        parsed = _rows_to_dicts(job["symbol"], job["interval"], rows)
-        if parsed:
-            with results_lock:
-                results.extend(parsed)
-            logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-            logging.info(f"Processed {len(parsed)} rows for job {job['symbol']}\
-                         from {job['start_min']} to {job['end_min']}")
-            
-    # Calculate total jobs
-    total_Jobs = total_jobs(start_min, end_min, interval, per_request_limit)        
+        total_Jobs, aligned_start, aligned_end = total_jobs(start_min, end_min, interval, per_request_limit)
 
-    warmup_jobs = 25
-    warmup_batch, remaining = jobs[:warmup_jobs], jobs[warmup_jobs:] 
-    
-    def run_warmup(batch):
-        rtt = []
-        for job in batch:
-            throttle.acquire(PerpFuturesWeights.KLINES)
-            path, params = build_kline_request(job, type = "future")
-            res = http.get(path, params=params)
-            rtt.append(res.elapsed_ms)
-            process_result(res, job)
-        if len(rtt) == 0:
-            warnings.warn("The warm up rtt list is empty - setting a default rtt of 0.25s")
-            rtt = 0.25
-        return np.mean(rtt) 
-    
-    max_threads = 20
-    rtt_s = run_warmup(warmup_batch)
-    target_workers = min(scale_func(rtt_s), max_threads)
+        jobs = list(
+            job_generator(
+                symbol=symbol,
+                interval=interval,
+                start_min=aligned_start,
+                end_min=aligned_end,
+                per_request_limit=per_request_limit,
+            )
+        )
 
-    # Build WorkerPool
-    pool = WorkerPool(
-        http= http,
-        throttle= throttle,
-        request_builder= build_kline_request,
-        response= process_result,
-        weight_per_request= PerpFuturesWeights.KLINES,
-        max_threads= max_threads,
-        initial_concurrency= target_workers,
-        market_type="future"
-    )
-    
-    # Submit all jobs at once
-    pool.submit_all(remaining)
-    pool.shutdown()
+        results_lock = asyncio.Lock()
 
-    # Build Polars DataFrame
-    if not results:
+        async def process_result(res: HttpResult, job: Dict[str, Any]):
+            rows = res.data if isinstance(res.data, list) else []
+            if not rows:
+                return
+            async with results_lock:
+                raw_rows.extend(rows)
+
+        max_concurrency = 50
+        weight_capacity = max(1, throttle.max_weight_minute // PerpFuturesWeights.KLINES)
+        target_workers = min(max_concurrency, weight_capacity, len(jobs) or 1)
+
+        pool = WorkerPool(
+            http=http,
+            throttle=throttle,
+            request_builder=build_kline_request,
+            response=process_result,
+            weight_per_request=PerpFuturesWeights.KLINES,
+            max_concurrency=max_concurrency,
+            market_type="usd_future",
+        )
+
+        await pool.run(jobs, concurrency=target_workers)
+        await pool.shutdown()
+
+    average_usage = throttle.mean_usage()
+
+    kline_columns = [
+        "open_time",
+        "open",
+        "high",
+        "low",
+        "close",
+        "volume",
+        "close_time",
+        "quote_volume",
+        "num_trades",
+        "taker_buy_base",
+        "taker_buy_quote",
+        "ignore",
+    ]
+
+    if not raw_rows:
         df = pl.DataFrame(
             {
                 "symbol": pl.Series([], pl.Utf8),
@@ -199,70 +152,96 @@ def get_klines(
             }
         )
     else:
-        df = pl.DataFrame(results)
-        df = df.sort(["open_time"])
+        df = pl.DataFrame(raw_rows, schema=kline_columns)
+        df = df.with_columns(
+            [
+                pl.col("open_time").cast(pl.Int64),
+                pl.col("close_time").cast(pl.Int64),
+                pl.col("num_trades").cast(pl.Int64),
+                pl.col("open").cast(pl.Float64),
+                pl.col("high").cast(pl.Float64),
+                pl.col("low").cast(pl.Float64),
+                pl.col("close").cast(pl.Float64),
+                pl.col("volume").cast(pl.Float64),
+                pl.col("quote_volume").cast(pl.Float64),
+                pl.col("taker_buy_base").cast(pl.Float64),
+                pl.col("taker_buy_quote").cast(pl.Float64),
+            ]
+        ).drop("ignore")
+        df = df.with_columns(
+            [
+                pl.lit(symbol).alias("symbol"),
+                pl.lit(interval).alias("interval"),
+            ]
+        )
+        df = df.select(
+            [
+                "symbol",
+                "interval",
+                "open_time",
+                "open",
+                "high",
+                "low",
+                "close",
+                "volume",
+                "close_time",
+                "quote_volume",
+                "num_trades",
+                "taker_buy_base",
+                "taker_buy_quote",
+            ]
+        )
         df = parse(df)
-    
-    start_label = datetime.datetime.fromisoformat(start_date).strftime("%Y%m%d-%H%M")
-    end_label = datetime.datetime.fromisoformat(end_date).strftime("%Y%m%d-%H%M")
+
+    start_label = datetime.fromisoformat(start_date).strftime("%Y%m%d-%H%M")
+    end_label = datetime.fromisoformat(end_date).strftime("%Y%m%d-%H%M")
 
     directory = Path(path).expanduser()
-    directory.mkdir(parents= True, exist_ok= True)
+    directory.mkdir(parents=True, exist_ok=True)
     out_parquet_path = directory / f"{symbol}_{interval}_{start_label}_{end_label}.parquet"
 
-    df.write_parquet(out_parquet_path) # parquet format 
-    
-    return df , out_parquet_path,\
-        total_klines, warmup_jobs,\
-        rtt_s, target_workers
+    df.write_parquet(out_parquet_path)
 
-# Example: BTCUSDT 1m, one year
-if __name__ == "__main__":
-    
-    import datetime
+    return df, out_parquet_path, target_workers, total_Jobs, average_usage
 
-    start = datetime.datetime.now()
+
+async def main():
+    start = datetime.now()
 
     REQUEST_LIMIT = 500
 
-    SYMBOL = ["ETHUSDT"] # add all the binance symbols to download 
+    SYMBOL = ["ETHUSDT"]
     INTERVAL = "1m"
     START = "2024-01-01 00:00"
-    END   = "2025-01-01 00:00"
+    END = "2025-01-01 00:00"
 
-    
     for ticker in SYMBOL:
-        
-        start_time = datetime.datetime.now()
+        run_start = datetime.now()
+        path = f"/home/homercrypton/hedge-room/data/binance/futures/ohlc/{INTERVAL}/{ticker}"
 
-        path = f"/home/homercrypton/hedge-room/data/binance/futures/ohlc/{INTERVAL}/{ticker}" # f"/Users/giuliomannini/Hedge-Room/data/binance/spot/ohlc/{INTERVAL}/{ticker}"
+        df, parquet_path, target_workers, total_jobs, avg_usage = await get_klines(
+            ticker,
+            INTERVAL,
+            START,
+            END,
+            path,
+            per_request_limit=REQUEST_LIMIT,
+        )
 
-        df, path, total_klines,\
-        warmup_jobs, rtt_s, parquet_path,\
-        target_workers= get_klines(ticker, INTERVAL, START, END, path, per_request_limit= REQUEST_LIMIT)
-        
-        print(f"Fetched {len(df)} rows → wrote {path}")
-        
-        # Stats
         total_klines = len(df)
-        end_time = datetime.now()
-        delta = end_time - start_time
+        run_end = datetime.now()
+        delta = run_end - run_start
         throughput = total_klines / delta.total_seconds() if delta.total_seconds() > 0 else 0.0
-        
+
         print(f"\nAll requests completed for {ticker}!")
-        print(" ")
-        if total_Jobs > warmup_jobs:
-            print(f"Average round time trip over {warmup_jobs} jobs is {rtt_s:.2f} seconds")
-            print(f"Number of target workers based on the average RTT is {target_workers}")
         print(f"Total time: {delta}")
         print(f"Total klines processed: {total_klines}")
-        print(f"Throughput: {int(throughput)} klines/sec")
-        print(" ")
+        print(f"Total requests processed: {total_jobs}")
+        print(f"Throughput: {throughput:.2f} klines/sec")
+        print(f"Target concurrency: {target_workers}")
+        print(f"Average weight usage: {avg_usage * 100:.2f}%")
         print(f"Parquet file located at: {parquet_path}")
         print(df.tail(5))
-    
-    end = datetime.now()
-    delta = end - start
-    print(" ")
-    print(df.columns)
-    print(f"All data were correctly retrieved in {delta}!")
+
+if __name__ == "__main__":
+    asyncio.run(main())

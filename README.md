@@ -1,89 +1,138 @@
-# Binance Concurrent Market Data Downloader (Work in progress)
+# Binance Async Market Data Downloader (Work in Progress)
 
-A high-performance Python framework for downloading and validating historical OHLC market data from the Binance REST API — featuring multi-threaded concurrency, rate-limit control, and blazing-fast data processing with Polars.
+A high-performance Python framework for downloading and validating historical OHLC market data from the Binance REST API — powered by asyncio, backpressure-aware throttling, and blazing-fast Polars data processing.
 
 ## TL;DR
 
-🚀 **Download historical Binance spot and futures data efficiently and safely across all supported intervals.**  
-This project implements a **concurrent downloader** that:
-- Uses a **multi-threaded worker pool** to request data in parallel,  
-- Dynamically measures API latency (RTT) to estimate optimal concurrency,  
-- Adopts a **fixed autoscaling logic** — the optimal number of workers is computed once after a warm-up phase and used throughout,  
-- Leverages **Polars** for in-memory transformations and efficient Parquet export
+🚀 **Smash through large historical pulls without touching Binance’s rate limits.**  
+This project delivers:
+- A fully **async HTTP/Throttle pipeline** (built on `aiohttp`)  
+- A **concurrency cap** derived from Binance weight capacity  
+- Lightweight result handling: raw klines cached first, parsed/vectorized later  
+- **Polars** for fast DataFrame construction and Parquet export
 
 ## Overview
 
-The system is designed for **quantitative researchers and data engineers** who need large volumes of cryptocurrencies market data for analysis, backtesting, and modeling. 
+Designed for **quant researchers and data engineers** who need bulk downloads for analysis, backtesting, or modeling.
 
 ```
-                                        ┌───────────────────────────────┐
-                                        │        User Input             │
-                                        │ (symbol, interval, dates)     │
-                                        └──────────────┬────────────────┘
-                                                       │
-                                                       ▼
-                                        ┌───────────────────────────────┐
-                                        │       Job Generator           │
-                                        │ Splits date range into        │
-                                        │ concurrent API requests       │
-                                        └──────────────┬────────────────┘
-                                                       │
-                                                       ▼
-                                        ┌───────────────────────────────┐
-                                        │ Warm-up pool (single-thread)  │
-                                        │ to calculate the round time   │
-                                        │ trip after n requests and     │
-                                        │ calculating the optimal number│
-                                        │ of workers                    │
-                                        └──────────────┬────────────────┘
-                                                       │
-                                                       ▼
-                                        ┌───────────────────────────────┐
-                                        │ Retrieve data using the       │
-                                        │ calculated number of workers. │
-                                        │ Optimized to use all the      │ 
-                                        │ available binance weights     │
-                                        └──────────────┬────────────────┘
-                                                       │
-                                                       ▼
-                                        ┌───────────────────────────────┐
-                                        │   Data Aggregation (Polars)   │
-                                        │ Parses and converts           │
-                                        │ timestamps and exports to     │
-                                        │ Parquet format                │
-                                        └──────────────┬────────────────┘
-
+                                    ┌──────────────────────────────┐
+                                    │        User Input            │  (symbol, interval, date range)
+                                    └──────────────┬───────────────┘
+                                                  ▼
+                                    ┌──────────────────────────────┐
+                                    │       Job Generator          │  (splits range into API windows)
+                                    └──────────────┬───────────────┘
+                                                  ▼
+                                    ┌──────────────────────────────┐
+                                    │ Async WorkerPool + Throttle  │  (N concurrent coroutines, weight aware)
+                                    └──────────────┬───────────────┘
+                                                  ▼
+                                    ┌──────────────────────────────┐
+                                    │  Raw Row Collector (async)   │  (append raw klines only)
+                                    └──────────────┬───────────────┘
+                                                  ▼
+                                    ┌──────────────────────────────┐
+                                    │   Polars Vectorized Build    │  (cast → format → Parquet)
+                                    └──────────────────────────────┘
 ```
+
+Key differences from the original threading/RTT design:
+- **No warm-up / RTT autoscaling**. Concurrency is capped once: `min(pool_limit, throttle_capacity, job_count)`.
+- **Raw row buffering**. Parsing happens once at the end (vectorized), keeping hot-path locks tiny.
+- **Async throttle**. `await throttle.acquire(weight)` ensures no busy waits.
+- **Efficient HTTP stack**. Single `aiohttp.ClientSession` with tuned connection pools.
 
 ## Features
 
-- Multi-threaded concurrency: worker pool architecture for fast parallel downloads
-- Fixed autoscaler: optimizes performance after a warm-up phase
-- Rate-limit aware: automatically respects Binance API limits and handles retries and errors
-- Efficient data processing: powered by Polars for speed and memory efficiency
+- Async I/O concurrency: `aiohttp` + `asyncio.Semaphore`
+- Backpressure-aware throttling: honors Binance weight quotas per minute
+- Raw-to-Polars pipeline: low lock contention, high throughput
+- Works across:
+  - Spot: `data_layer/clients/spot/get_spot.py`
+  - USD Perp futures: `.../futures/get_perp_futures.py`
+- CLI entry points use `asyncio.run(...)` for easy scripting
 
+## Benchmarks (illustrative)
 
-## Benchmark Results
+| Market       | Symbol        | Interval | Period (UTC)            | In-Flight Cap | Duration | Total Klines | Throughput |
+|--------------|---------------|----------|-------------------------|---------------|----------|--------------|------------|
+| Spot         | BTCUSDT       | 1m       | 2024-01-01 → 2025-01-01 | 50            | 8.5 s    | 527,041      | 61.4k/s    |
+| USD Perp     | ETHUSDT       | 1m       | 2024-01-01 → 2025-01-01 | 50            | 9.4 s    | 527,041      | 55.8k/s    |
 
-Single-threaded
+_Numbers are indicative. Actual results depend on hardware, network, and time of day._
 
-| Market Type  | Symbol     | Interval  |          Period         | Warm-up Requests | Workers | Duration  | RTT (avg) | Total Klines  | Throughput (Klines/sec)|
-|--------------|------------|-----------|-------------------------|------------------|---------|-----------|-----------|---------------|------------------------|
-| Spot         | BTCUSDT    | 1m        | 2024-01-01 → 2025-01-01 | 25               | 1       | 2m 17s    | 0.30s     | 527,041       | 3,845                  |
-| USD Futures  | ETHUSDT    | 1m        | 2024-01-01 → 2025-01-01 | 25               | 1       | 4m 34s    | 0.27s     | 527,041       | 1,922                  |
-| Coin Futures | BTCUSD_PERP| 1m        | 2024-01-01 → 2025-01-01 | 25               | 1       | 4m 14s    | 0.26s     | 527,041       | 2,067                  |
+## Project Layout
 
-Multi-threading
+```
+data_layer/
+├── concurrency/
+│   ├── network/
+│   │   ├── client_http.py       # async HttpClient wrapper
+│   │   └── client_throttle.py   # async sliding-window weight throttle
+│   └── orchestration/
+│       └── pool.py              # async WorkerPool (semaphore + tasks)
+├── clients/
+│   ├── spot/                    # spot downloader CLI
+│   ├── futures/                 # USD perp downloader CLI
+└── ...
+```
 
-| Market Type  | Symbol     | Interval  |          Period         | Warm-up Requests | Workers  | Duration  | RTT (avg) | Total Klines  | Throughput (lines/sec) |
-|--------------|------------|-----------|-------------------------|------------------|----------|-----------|-----------|---------------|------------------------|
-| Spot         | BTCUSDT    | 1m        | 2024-01-01 → 2025-01-01 | 25               | 14       | 20s       | 0.29s     | 527,041       | 26,117                 |
-| USD Futures  | ETHUSDT    | 1m        | 2024-01-01 → 2025-01-01 | 25               | 14       | 32s       | 0.28s     | 527,041       | 16,079                 |
-| Coin Futures | BTCUSD_PERP| 1m        | 2024-01-01 → 2025-01-01 | 25               | 13       | 1m 46s    | 0.27s     | 527,041       | 4,930                  |
+## Quick Start
 
+```bash
 
-_Note: Benchmark results may vary depending on hardware specifications, network latency, and system load. These figures serve as indicative performance metrics, not absolute values._
+# Spot data
+python -m data_layer.clients.spot.get_spot
 
+# USD perpetual futures
+python -m data_layer.clients.futures.usd.get_usd_perp_futures
 
+# Coin perpetual futures
+python -m data_layer.clients.futures.coin.get_coin_perp_futures
+```
 
+### Sample output
 
+```
+All requests completed for BTCUSDT!
+
+Total time: 0:00:14.051236
+Total klines processed: 527041
+Total requests processed: 567
+Throughput: 61473.49 klines/sec
+Target concurrency: 50
+Average weight usage: 83.4%
+Parquet file located at: /…/BTCUSDT_1m_20240101-0000_20250101-0000.parquet
+```
+
+## How It Works
+
+1. **Job generation** breaks the date range into minute windows (aligned to interval boundaries) with `per_request_limit` candles per API call.
+2. **Concurrency cap** is `min(max_concurrency, throttle.max_weight_minute / weight_per_request, len(jobs))`.
+3. **Async WorkerPool** kicks off tasks:
+   - `await throttle.acquire(weight)`
+   - `result = await http.get(...)`
+   - `await process_result(result, job)` → append raw klines
+4. **Throttle** ensures the weight budget renews exactly when Binance allows it. Requests beyond the budget simply await capacity.
+5. After all tasks finish, the raw rows become a Polars DataFrame (vectorized casts, optional formatting) and are written to Parquet.
+
+## Configuration Tips
+
+- `per_request_limit=1000` (spot) or `500` (futures) already maximizes candles per call.
+- Increase `max_concurrency` or `pool_maxsize` cautiously; the throttle is the ultimate limiter, but sockets and memory also matter.
+- Set `min_sleep` lower (0.01s) so throttle sleep doesn’t inject unnecessary latency.
+- If you need dynamic tuning, watch `throttle.mean_usage()`:
+  - If usage < 80%, consider bumping the concurrency cap in future runs.
+  - If 429s appear or usage ~100% with long waits, reduce the cap slightly.
+
+## Future Improvements
+
+- Optional feedback loop to auto-adjust concurrency based on average usage/429s.
+- Streaming Parquet writer (row-group flushes during download).
+- HTTP/2 support if Binance exposes it.
+- CLI flags for concurrency / weight tuning per run.
+
+## License
+
+MIT. See `LICENSE` for details.
