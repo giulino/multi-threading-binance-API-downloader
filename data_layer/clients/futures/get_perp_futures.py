@@ -78,7 +78,7 @@ async def get_klines(
         pool_maxsize=128,
     ) as http:
 
-        total_Jobs, aligned_start, aligned_end = total_jobs(start_min, end_min, interval, per_request_limit)
+        job_count, aligned_start, aligned_end = total_jobs(start_min, end_min, interval, per_request_limit)
 
         jobs = list(
             job_generator(
@@ -134,23 +134,22 @@ async def get_klines(
     ]
 
     if not raw_rows:
-        df = pl.DataFrame(
-            {
-                "symbol": pl.Series([], pl.Utf8),
-                "interval": pl.Series([], pl.Utf8),
-                "open_time": pl.Series([], pl.Int64),
-                "open": pl.Series([], pl.Float64),
-                "high": pl.Series([], pl.Float64),
-                "low": pl.Series([], pl.Float64),
-                "close": pl.Series([], pl.Float64),
-                "volume": pl.Series([], pl.Float64),
-                "close_time": pl.Series([], pl.Int64),
-                "quote_volume": pl.Series([], pl.Float64),
-                "num_trades": pl.Series([], pl.Int64),
-                "taker_buy_base": pl.Series([], pl.Float64),
-                "taker_buy_quote": pl.Series([], pl.Float64),
-            }
-        )
+        schema = {
+            "symbol": pl.Utf8,
+            "interval": pl.Utf8,
+            "open_time": pl.Int64,
+            "open": pl.Float64,
+            "high": pl.Float64,
+            "low": pl.Float64,
+            "close": pl.Float64,
+            "volume": pl.Float64,
+            "close_time": pl.Int64,
+            "quote_volume": pl.Float64,
+            "num_trades": pl.Int64,
+            "taker_buy_base": pl.Float64,
+            "taker_buy_quote": pl.Float64,
+        }
+        df = pl.DataFrame({name: [] for name in schema}, schema=schema)
     else:
         df = pl.DataFrame(raw_rows, schema=kline_columns)
         df = df.with_columns(
@@ -202,11 +201,10 @@ async def get_klines(
 
     df.write_parquet(out_parquet_path)
 
-    return df, out_parquet_path, target_workers, total_Jobs, average_usage
+    return df, out_parquet_path, target_workers, job_count, average_usage
 
 
 async def main():
-    start = datetime.now()
 
     REQUEST_LIMIT = 500
 

@@ -49,10 +49,19 @@ Designed for **quant researchers and data engineers** who need bulk downloads fo
 
 ## Benchmarks
 
+Asyncronous
+
 | Market       | Symbol        | Interval | Period (UTC)            | In-Flight Cap | Duration | Total Klines | Throughput |
 |--------------|---------------|----------|-------------------------|---------------|----------|--------------|------------|
-| Spot         | BTCUSDT       | 1m       | 2024-01-01 → 2025-01-01 | 50            | 8.5 s    | 527,041      | 61.4k/s    |
-| USD Perp     | ETHUSDT       | 1m       | 2024-01-01 → 2025-01-01 | 50            | 9.4 s    | 527,041      | 55.8k/s    |
+| Spot         | BTCUSDT       | 1m       | 2024-01-01 → 2025-01-01 |      50       | 8.5 s    | 527,041      | 61.4k/s    |
+| USD Perp     | ETHUSDT       | 1m       | 2024-01-01 → 2025-01-01 |      50       | 9.4 s    | 527,041      | 55.8k/s    |
+
+While loop
+
+| Market       | Symbol        | Interval | Period (UTC)            | In-Flight Cap | Duration | Total Klines | Throughput |
+|--------------|---------------|----------|-------------------------|---------------|----------|--------------|------------|
+| Spot         | BTCUSDT       | 1m       | 2024-01-01 → 2025-01-01 |       -       | 305 s    | 527,041      |  1.7k/s    |
+| USD Perp     | ETHUSDT       | 1m       | 2024-01-01 → 2025-01-01 |       -       | 313 s    | 527,041      |  1.6k/s    |
 
 _Numbers are indicative. Actual results depend on hardware, network, and time of day._
 
