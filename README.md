@@ -16,32 +16,26 @@ This project delivers:
 Designed for **quant researchers and data engineers** who need bulk downloads for analysis, backtesting, or modeling.
 
 ```
-                                    ┌──────────────────────────────┐
-                                    │        User Input            │  (symbol, interval, date range)
-                                    └──────────────┬───────────────┘
-                                                  ▼
-                                    ┌──────────────────────────────┐
-                                    │       Job Generator          │  (splits range into API windows)
-                                    └──────────────┬───────────────┘
-                                                  ▼
-                                    ┌──────────────────────────────┐
-                                    │ Async WorkerPool + Throttle  │  (N concurrent coroutines, weight aware)
-                                    └──────────────┬───────────────┘
-                                                  ▼
-                                    ┌──────────────────────────────┐
-                                    │  Raw Row Collector (async)   │  (append raw klines only)
-                                    └──────────────┬───────────────┘
-                                                  ▼
-                                    ┌──────────────────────────────┐
-                                    │   Polars Vectorized Build    │  (cast → format → Parquet)
-                                    └──────────────────────────────┘
+  ┌──────────────────────────────┐
+  │        User Input            │  (symbol, interval, date range)
+  └──────────────┬───────────────┘
+                 ▼
+  ┌──────────────────────────────┐
+  │       Job Generator          │  (splits range into API windows)
+  └──────────────┬───────────────┘
+                 ▼
+  ┌──────────────────────────────┐
+  │ Async WorkerPool + Throttle  │  (N concurrent coroutines, weight aware)
+  └──────────────┬───────────────┘
+                 ▼ 
+  ┌──────────────────────────────┐
+  │  Raw Row Collector (async)   │  (append raw klines only)
+  └──────────────┬───────────────┘
+                 ▼
+  ┌──────────────────────────────┐
+  │   Polars Vectorized Build    │  (cast → format → Parquet)
+  └──────────────────────────────┘
 ```
-
-Key differences from the original threading/RTT design:
-- **No warm-up / RTT autoscaling**. Concurrency is capped once: `min(pool_limit, throttle_capacity, job_count)`.
-- **Raw row buffering**. Parsing happens once at the end (vectorized), keeping hot-path locks tiny.
-- **Async throttle**. `await throttle.acquire(weight)` ensures no busy waits.
-- **Efficient HTTP stack**. Single `aiohttp.ClientSession` with tuned connection pools.
 
 ## Features
 
@@ -51,9 +45,9 @@ Key differences from the original threading/RTT design:
 - Works across:
   - Spot: `data_layer/clients/spot/get_spot.py`
   - USD Perp futures: `.../futures/get_perp_futures.py`
-- CLI entry points use `asyncio.run(...)` for easy scripting
+- CLI entry points use `asyncio.run(...)`
 
-## Benchmarks (illustrative)
+## Benchmarks
 
 | Market       | Symbol        | Interval | Period (UTC)            | In-Flight Cap | Duration | Total Klines | Throughput |
 |--------------|---------------|----------|-------------------------|---------------|----------|--------------|------------|
@@ -122,17 +116,4 @@ Parquet file located at: /…/BTCUSDT_1m_20240101-0000_20250101-0000.parquet
 - `per_request_limit=1000` (spot) or `500` (futures) already maximizes candles per call.
 - Increase `max_concurrency` or `pool_maxsize` cautiously; the throttle is the ultimate limiter, but sockets and memory also matter.
 - Set `min_sleep` lower (0.01s) so throttle sleep doesn’t inject unnecessary latency.
-- If you need dynamic tuning, watch `throttle.mean_usage()`:
-  - If usage < 80%, consider bumping the concurrency cap in future runs.
-  - If 429s appear or usage ~100% with long waits, reduce the cap slightly.
 
-## Future Improvements
-
-- Optional feedback loop to auto-adjust concurrency based on average usage/429s.
-- Streaming Parquet writer (row-group flushes during download).
-- HTTP/2 support if Binance exposes it.
-- CLI flags for concurrency / weight tuning per run.
-
-## License
-
-MIT. See `LICENSE` for details.
