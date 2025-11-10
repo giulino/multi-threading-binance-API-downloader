@@ -11,6 +11,8 @@ This project delivers:
 - Lightweight result handling: raw klines cached first, parsed/vectorized later  
 - **Polars** for fast DataFrame construction and Parquet export
 
+You can find a more detailed explanation here: https://substack.com/@mannini/note/p-178069040?r=qu39u&utm_source=notes-share-action&utm_medium=web 
+
 ## Overview
 
 Designed for **quant researchers and data engineers** who need bulk downloads for analysis, backtesting, or modeling.
@@ -125,4 +127,3 @@ Parquet file located at: /…/BTCUSDT_1m_20240101-0000_20250101-0000.parquet
 - `per_request_limit=1000` (spot) or `500` (futures) already maximizes candles per call.
 - Increase `max_concurrency` or `pool_maxsize` cautiously; the throttle is the ultimate limiter, but sockets and memory also matter.
 - Set `min_sleep` lower (0.01s) so throttle sleep doesn’t inject unnecessary latency.
-
