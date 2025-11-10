@@ -1,4 +1,4 @@
-# Binance Async Market Data Downloader (Work in Progress)
+# Binance Async Market Data Downloader
 
 A high-performance Python framework for downloading and validating historical OHLC market data from the Binance REST API — powered by asyncio, backpressure-aware throttling, and blazing-fast Polars data processing.
 
